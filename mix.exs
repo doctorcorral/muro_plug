@@ -29,7 +29,9 @@ defmodule MuroPlug.MixProject do
       {:muro, "~> 0.22.38"},
       {:thousand_island, "~> 1.0"},
       {:plug, "~> 1.16"},
-      {:phoenix, "~> 1.8", only: :test}
+      {:websock, "~> 0.5"},
+      {:phoenix, "~> 1.8", only: :test},
+      {:websock_adapter, "~> 0.5", only: :test}
     ]
   end
 

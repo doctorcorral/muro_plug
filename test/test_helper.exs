@@ -218,5 +218,153 @@ defmodule MuroPlug.TestCert do
     do: [verify: :verify_peer, cacertfile: String.to_charlist(cacertfile())]
 end
 
+defmodule MuroPlug.WSClient do
+  @moduledoc false
+  # A raw RFC 6455 client on `MuroPlug.TestClient` sockets (TCP or
+  # `{:tls, s}`), so tests write exact frames, masked or not, and read
+  # the server's frames off the wire.
+
+  alias MuroPlug.TestClient
+
+  @ops %{continuation: 0, text: 1, binary: 2, close: 8, ping: 9, pong: 10}
+
+  def key, do: Base.encode64(:crypto.strong_rand_bytes(16))
+
+  def upgrade_request(path, opts \\ []) do
+    key = Keyword.get(opts, :key, key())
+    method = Keyword.get(opts, :method, "GET")
+    version = Keyword.get(opts, :version, "HTTP/1.1")
+
+    base = [
+      {"Host", "localhost"},
+      {"Upgrade", "websocket"},
+      {"Connection", "Upgrade"},
+      {"Sec-WebSocket-Key", key},
+      {"Sec-WebSocket-Version", "13"}
+    ]
+
+    drop = Keyword.get(opts, :drop, [])
+    headers = Enum.reject(base, fn {k, _} -> k in drop end)
+    headers = Enum.map(headers, fn {k, v} -> {k, Keyword.get(opts, header_opt(k), v)} end)
+    extra = Keyword.get(opts, :headers, [])
+
+    {key,
+     [
+       method,
+       " ",
+       path,
+       " ",
+       version,
+       "\r\n",
+       Enum.map(headers ++ extra, fn {k, v} -> [k, ": ", v, "\r\n"] end),
+       "\r\n"
+     ]
+     |> IO.iodata_to_binary()}
+  end
+
+  defp header_opt("Upgrade"), do: :upgrade
+  defp header_opt("Connection"), do: :connection
+  defp header_opt("Sec-WebSocket-Version"), do: :ws_version
+  defp header_opt(_), do: :unused
+
+  # Connect, upgrade, and check the 101. Returns {socket, response, rest}.
+  def connect(port, scheme, path \\ "/ws", opts \\ []) do
+    s = open(port, scheme)
+    {key, req} = upgrade_request(path, opts)
+    :ok = TestClient.send_bytes(s, [req | Keyword.get(opts, :pipelined, [])])
+    {:ok, resp, rest} = TestClient.read(s)
+    101 = resp.status
+    true = TestClient.header(resp, "sec-websocket-accept") == accept(key)
+    {s, resp, rest}
+  end
+
+  def open(port, :ws), do: TestClient.connect(port)
+  def open(port, :wss), do: TestClient.connect_tls(port)
+
+  def accept(key),
+    do: Base.encode64(:crypto.hash(:sha, key <> "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
+
+  # One client frame. Options: fin, rsv, mask (default true), and a raw
+  # integer opcode.
+  def frame(op, payload, opts \\ []) do
+    payload = IO.iodata_to_binary(payload)
+    fin = if Keyword.get(opts, :fin, true), do: 1, else: 0
+    rsv = Keyword.get(opts, :rsv, 0)
+    code = if is_integer(op), do: op, else: Map.fetch!(@ops, op)
+    len = byte_size(payload)
+
+    {len7, ext} =
+      cond do
+        len < 126 -> {len, <<>>}
+        len < 65_536 -> {126, <<len::16>>}
+        true -> {127, <<len::64>>}
+      end
+
+    if Keyword.get(opts, :mask, true) do
+      key = :crypto.strong_rand_bytes(4)
+
+      <<fin::1, rsv::3, code::4, 1::1, len7::7, ext::binary, key::binary,
+        MuroPlug.WebSocket.Frame.unmask(payload, key)::binary>>
+    else
+      <<fin::1, rsv::3, code::4, 0::1, len7::7, ext::binary, payload::binary>>
+    end
+  end
+
+  def send_frame(s, op, payload, opts \\ []),
+    do: TestClient.send_bytes(s, frame(op, payload, opts))
+
+  # One server frame: {:ok, {fin, op, payload, length_code}, rest}. The
+  # server must not mask.
+  def recv(s, buf \\ <<>>, timeout \\ 2_000) do
+    case parse(buf) do
+      {:ok, frame, rest} ->
+        {:ok, frame, rest}
+
+      :more ->
+        case TestClient.recv(s, 0, timeout) do
+          {:ok, more} -> recv(s, buf <> more, timeout)
+          {:error, reason} -> {:error, reason, buf}
+        end
+    end
+  end
+
+  defp parse(<<fin::1, 0::3, code::4, 0::1, len7::7, rest::binary>>) do
+    {len, rest} =
+      case {len7, rest} do
+        {126, <<n::16, r::binary>>} -> {n, r}
+        {127, <<n::64, r::binary>>} -> {n, r}
+        {n, r} when n < 126 -> {n, r}
+        _ -> {nil, rest}
+      end
+
+    case rest do
+      <<payload::binary-size(^len), tail::binary>> when is_integer(len) ->
+        op = Enum.find_value(@ops, fn {k, v} -> if v == code, do: k end)
+        {:ok, {fin == 1, op, payload, len7}, tail}
+
+      _ ->
+        :more
+    end
+  end
+
+  defp parse(<<_, 1::1, _::bitstring>>), do: raise("server frame is masked")
+  defp parse(_), do: :more
+
+  # The next frame's {op, payload}.
+  def next(s, buf \\ <<>>) do
+    {:ok, {true, op, payload, _}, rest} = recv(s, buf)
+    {op, payload, rest}
+  end
+
+  # Read the server's close frame: {code | nil, reason}.
+  def close_frame(s, buf \\ <<>>) do
+    case recv(s, buf) do
+      {:ok, {true, :close, <<code::16, reason::binary>>, _}, _} -> {code, reason}
+      {:ok, {true, :close, <<>>, _}, _} -> {nil, <<>>}
+      {:ok, {_, op, _, _}, rest} when op in [:ping, :pong, :text, :binary] -> close_frame(s, rest)
+    end
+  end
+end
+
 {:ok, _} = Application.ensure_all_started(:ssl)
 MuroPlug.TestCert.setup!()

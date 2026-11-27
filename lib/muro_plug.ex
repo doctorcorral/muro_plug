@@ -61,6 +61,9 @@ defmodule MuroPlug do
   given with `scheme: :http` (top-level or in `:transport_options`)
   raise `ArgumentError`.
 
+  WebSocket upgrades (`ws://` over `:http`, `wss://` over `:https`) go
+  through the `WebSock` API; see `MuroPlug.WebSocket`.
+
   For Phoenix, see `MuroPlug.PhoenixAdapter`.
   """
 

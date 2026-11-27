@@ -70,7 +70,7 @@ defmodule MuroPlug.HTTPTest do
     end
 
     defp route("GET", ["upgrade"], conn) do
-      result = conn.adapter |> elem(0) |> apply(:upgrade, [elem(conn.adapter, 1), :websocket, []])
+      result = conn.adapter |> elem(0) |> apply(:upgrade, [elem(conn.adapter, 1), :h2c, []])
       send_resp(conn, 200, inspect(result))
     end
 
@@ -421,7 +421,7 @@ defmodule MuroPlug.HTTPTest do
     assert {:ok, %{status: 200, body: "after hints"}, ""} = read(s, rest)
   end
 
-  test "upgrade is not supported yet", %{port: port} do
+  test "upgrades other than :websocket are not supported", %{port: port} do
     assert request(port, "GET /upgrade HTTP/1.1\r\nHost: h\r\n\r\n").body ==
              "{:error, :not_supported}"
   end
