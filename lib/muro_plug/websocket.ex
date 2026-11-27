@@ -39,6 +39,10 @@ defmodule MuroPlug.WebSocket do
       Defaults to `5_000`.
     * `:fullsweep_after`, `:max_heap_size` — process flags for the
       connection process.
+
+  Known options with bad values (e.g. `close_timeout: :infinity`)
+  raise `ArgumentError` from the upgrade, before the 101; unknown keys
+  are ignored.
     * `:compress` — accepted and ignored: no extension is negotiated,
       `permessage-deflate` is never advertised, and frames with RSV
       bits set are a protocol error (1002).

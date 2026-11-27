@@ -36,6 +36,54 @@ defmodule MuroPlug.WebSocket.Connection do
   @type result :: {:continue, t()} | {:linger, t()} | {:close, t()}
 
   @close_timer {__MODULE__, :close_timeout}
+  @coalesce 1024
+
+  @doc """
+  Check the upgrade's options before the 101 is written. Unknown keys
+  (Phoenix passes its whole socket config) are ignored; a known key
+  with a bad value raises `ArgumentError`.
+  """
+  @spec validate_opts!(keyword()) :: :ok
+  def validate_opts!(opts) when is_list(opts) do
+    Enum.each(opts, fn
+      {key, value} when key in [:timeout, :max_frame_size, :max_message_size] ->
+        unless value == :infinity or (is_integer(value) and value >= 0),
+          do: bad_opt!(key, value, "a non-negative integer or :infinity")
+
+      {:close_timeout, value} ->
+        unless is_integer(value) and value >= 0,
+          do: bad_opt!(:close_timeout, value, "a non-negative integer (milliseconds)")
+
+      {key, value} when key in [:validate_utf8, :compress] ->
+        unless is_boolean(value), do: bad_opt!(key, value, "a boolean")
+
+      {key, nil} when key in [:fullsweep_after, :max_heap_size] ->
+        :ok
+
+      {:fullsweep_after, value} ->
+        unless is_integer(value) and value >= 0,
+          do: bad_opt!(:fullsweep_after, value, "a non-negative integer")
+
+      {:max_heap_size, value} ->
+        unless (is_integer(value) and value >= 0) or is_map(value),
+          do: bad_opt!(:max_heap_size, value, "a non-negative integer or a map")
+
+      _other ->
+        :ok
+    end)
+  end
+
+  def validate_opts!(opts),
+    do:
+      raise(
+        ArgumentError,
+        "MuroPlug: WebSocket options must be a keyword list, got: #{inspect(opts)}"
+      )
+
+  defp bad_opt!(key, value, expected) do
+    raise ArgumentError,
+          "MuroPlug: WebSocket option #{inspect(key)} must be #{expected}, got: #{inspect(value)}"
+  end
 
   @doc "The connection for `{handler, state, opts}` before `init/1` runs."
   @spec new(module(), keyword()) :: t()
@@ -127,7 +175,7 @@ defmodule MuroPlug.WebSocket.Connection do
   defp frame({_fin, :close, _}, _socket, %__MODULE__{phase: :closing} = conn), do: {:close, conn}
   defp frame(_frame, _socket, %__MODULE__{phase: :closing} = conn), do: {:continue, conn}
 
-  defp frame({_fin, op, _}, socket, %__MODULE__{frag: {_, _, _}} = conn)
+  defp frame({_fin, op, _}, socket, %__MODULE__{frag: {_, _, _, _}} = conn)
        when op in [:text, :binary],
        do: fail(1002, :data_frame_mid_message, socket, conn)
 
@@ -135,18 +183,26 @@ defmodule MuroPlug.WebSocket.Connection do
     do: message(op, data, socket, conn)
 
   defp frame({false, op, data}, socket, conn) when op in [:text, :binary],
-    do: fragment(op, [data], byte_size(data), socket, conn)
+    do: fragment(op, data, socket, conn)
 
   defp frame({_fin, :continuation, _}, socket, %__MODULE__{frag: nil} = conn),
     do: fail(1002, :unexpected_continuation, socket, conn)
 
-  defp frame({fin, :continuation, data}, socket, %__MODULE__{frag: {op, acc, size}} = conn) do
+  defp frame({fin, :continuation, data}, socket, %__MODULE__{frag: {op, chunks, n, size}} = conn) do
     size = size + byte_size(data)
 
     cond do
-      too_big?(size, conn.max_message) -> fail(1009, :message_too_big, socket, conn)
-      fin -> message(op, IO.iodata_to_binary([acc | data]), socket, %{conn | frag: nil})
-      true -> {:continue, %{conn | frag: {op, [acc | data], size}}}
+      too_big?(size, conn.max_message) ->
+        fail(1009, :message_too_big, socket, conn)
+
+      fin ->
+        message(op, IO.iodata_to_binary(Enum.reverse([data | chunks])), socket, %{
+          conn
+          | frag: nil
+        })
+
+      true ->
+        {:continue, %{conn | frag: chunk(op, [data | chunks], n + 1, size)}}
     end
   end
 
@@ -171,11 +227,19 @@ defmodule MuroPlug.WebSocket.Connection do
     end
   end
 
-  defp fragment(op, acc, size, socket, conn) do
-    if too_big?(size, conn.max_message),
+  defp fragment(op, data, socket, conn) do
+    if too_big?(byte_size(data), conn.max_message),
       do: fail(1009, :message_too_big, socket, conn),
-      else: {:continue, %{conn | frag: {op, acc, size}}}
+      else: {:continue, %{conn | frag: {op, [data], 1, byte_size(data)}}}
   end
+
+  # A fragmented message is {opcode, chunks newest first, chunk count,
+  # octets}. Every @coalesce chunks fold into one binary, so many tiny
+  # fragments cost binaries, not a cons cell (and a refc binary) each.
+  defp chunk(op, chunks, n, size) when n >= @coalesce,
+    do: {op, [IO.iodata_to_binary(Enum.reverse(chunks))], 1, size}
+
+  defp chunk(op, chunks, n, size), do: {op, chunks, n, size}
 
   defp message(op, data, socket, conn) do
     cond do

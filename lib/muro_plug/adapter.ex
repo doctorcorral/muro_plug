@@ -166,13 +166,16 @@ defmodule MuroPlug.Adapter do
   The request must be an RFC 6455 opening handshake
   (`MuroPlug.WebSocket.check/3`); if not, this raises
   `MuroPlug.WebSocket.UpgradeError` (400, or 426 for a version other
-  than 13). The spec is kept on the payload; after the Plug returns,
+  than 13). Bad option values raise `ArgumentError` before anything is
+  written. The spec is kept on the payload; after the Plug returns,
   `MuroPlug.Handler` writes the 101 and runs the WebSocket on this
   socket. Other protocols are `{:error, :not_supported}`.
   """
   @impl true
   def upgrade(%__MODULE__{} = p, :websocket, {websock, _state, opts} = spec)
       when is_atom(websock) and is_list(opts) do
+    :ok = MuroPlug.WebSocket.Connection.validate_opts!(opts)
+
     case MuroPlug.WebSocket.check(p.method, p.http11, p.headers) do
       {:ok, key} ->
         {:ok, %{p | upgrade: {:websocket, spec, key}}}

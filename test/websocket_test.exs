@@ -107,6 +107,12 @@ defmodule MuroPlug.WebSocketTest do
     defp route(["nocheck"], conn, opts),
       do: WebSockAdapter.upgrade(conn, Echo, %{test: opts.test}, validate_utf8: false)
 
+    defp route(["close_fast"], conn, opts),
+      do: WebSockAdapter.upgrade(conn, Echo, %{test: opts.test}, close_timeout: 50)
+
+    defp route(["bad_opts"], conn, opts),
+      do: WebSockAdapter.upgrade(conn, Echo, %{test: opts.test}, close_timeout: :infinity)
+
     defp route(["minimal"], conn, _opts), do: WebSockAdapter.upgrade(conn, Minimal, nil, [])
     defp route(["init_push"], conn, _opts), do: WebSockAdapter.upgrade(conn, InitPush, nil, [])
 
@@ -246,6 +252,21 @@ defmodule MuroPlug.WebSocketTest do
       end
     end
 
+    test "an upgrade with an unread streamed body gets 400 and a close", ctx do
+      {_key, cl} = upgrade_request("/ws", headers: [{"Content-Length", "100000"}])
+      {_key, te} = upgrade_request("/ws", headers: [{"Transfer-Encoding", "chunked"}])
+
+      for req <- [cl <> :binary.copy("x", 10), te <> "10000\r\n" <> :binary.copy("y", 20_000)] do
+        s = open(ctx.port, ctx.scheme)
+        :ok = TestClient.send_bytes(s, req)
+        {:ok, r, _} = TestClient.read(s)
+        assert r.status == 400
+        assert TestClient.header(r, "connection") == "close"
+        assert closed?(s)
+        refute_received {:init, _}
+      end
+    end
+
     test "WebSockAdapter's own validation failure is a 400", ctx do
       {_key, req} = upgrade_request("/ws", drop: ["Sec-WebSocket-Key"])
       r = raw(ctx, req)
@@ -295,6 +316,43 @@ defmodule MuroPlug.WebSocketTest do
       assert {:binary, <<1, 2, 3>>, _} = next(s)
     end
 
+    test "2000 one-byte fragments reassemble exactly, with bounded state", ctx do
+      %{s: s, pid: pid} = up(ctx)
+      bytes = for i <- 1..2000, do: <<rem(i, 251)>>
+      [first | rest] = bytes
+      {middle, [last]} = Enum.split(rest, -1)
+
+      # 1500 fragments, then look at the connection's state mid-message.
+      {before, later} = Enum.split(middle, 1499)
+
+      :ok =
+        TestClient.send_bytes(s, [
+          frame(:binary, first, fin: false)
+          | Enum.map(before, &frame(:continuation, &1, fin: false))
+        ])
+
+      :ok = send_frame(s, :ping, "sync")
+      assert {:pong, "sync", _} = next(s)
+
+      {_socket, %MuroPlug.WebSocket.Connection{frag: {:binary, chunks, n, size}}} =
+        :sys.get_state(pid)
+
+      assert size == 1500
+      assert n == length(chunks) and n <= 1024
+      assert Enum.all?(chunks, &is_binary/1)
+
+      :ok =
+        TestClient.send_bytes(s, [
+          Enum.map(later, &frame(:continuation, &1, fin: false)),
+          frame(:continuation, last)
+        ])
+
+      expected = IO.iodata_to_binary(bytes)
+      {:ok, {true, :binary, got, _}, _} = recv(s, <<>>, 5_000)
+      assert is_binary(got) and got == expected
+      assert_receive {:in, :binary, 2000}
+    end
+
     test "frames sent one byte at a time", ctx do
       %{s: s} = up(ctx)
 
@@ -334,6 +392,10 @@ defmodule MuroPlug.WebSocketTest do
           {"a continuation with no message", quote(do: frame(:continuation, "x")), 1002},
           {"a text frame inside a fragmented message",
            quote(do: frame(:text, "a", fin: false) <> frame(:text, "b")), 1002},
+          {"a 16-bit length under 126 (non-minimal)",
+           quote(do: <<0x82, 0xFE, 5::16, 0::32, "hello">>), 1002},
+          {"a 64-bit length under 65536 (non-minimal)",
+           quote(do: <<0x82, 0xFF, 200::64, 0::32, :binary.copy("a", 200)::binary>>), 1002},
           {"a 64-bit length with the high bit set", quote(do: <<0x82, 0xFF, 1::1, 0::63, 0::32>>),
            1002},
           {"invalid UTF-8 text", quote(do: frame(:text, <<0xC3, 0x28>>)), 1007},
@@ -458,6 +520,18 @@ defmodule MuroPlug.WebSocketTest do
       answer_close(s)
     end
 
+    test "a client that never answers the server's close is dropped after close_timeout",
+         ctx do
+      %{s: s} = up(ctx, "/close_fast")
+      :ok = send_frame(s, :text, "stop")
+      t0 = System.monotonic_time(:millisecond)
+      assert {1000, ""} = close_frame(s)
+      assert {:error, :closed} = TestClient.recv(s, 0, 1_000)
+      # close_timeout is 50 ms; the default (5 s) would fail the 1 s recv.
+      assert System.monotonic_time(:millisecond) - t0 < 1_000
+      assert_receive {:terminate, :normal}
+    end
+
     test "after the server's close, frames are ignored until the client's close", ctx do
       %{s: s} = up(ctx)
       :ok = send_frame(s, :text, "stop")
@@ -552,6 +626,18 @@ defmodule MuroPlug.WebSocketLogTest do
     assert log =~ "{websock_module, state, opts}"
   end
 
+  test "bad WebSocket options raise before the 101", ctx do
+    {_key, req} = upgrade_request("/bad_opts")
+
+    log =
+      capture_log(fn ->
+        assert raw(ctx, req).status == 500
+      end)
+
+    assert log =~ ":close_timeout must be a non-negative integer"
+    refute_received {:init, _}
+  end
+
   test "a raising handle_in closes with 1011 and logs", ctx do
     {s, _resp, <<>>} = connect(ctx.port, ctx.scheme)
     assert_receive {:init, _}
@@ -621,6 +707,42 @@ defmodule MuroPlug.WebSocketFrameTest do
 
     # RFC 6455 §5.7: "Hello" masked with 37 fa 21 3d.
     assert Frame.unmask("Hello", <<0x37, 0xFA, 0x21, 0x3D>>) == <<0x7F, 0x9F, 0x4D, 0x51, 0x58>>
+  end
+
+  test "WebSocket options are validated" do
+    alias MuroPlug.WebSocket.Connection
+
+    assert Connection.validate_opts!([]) == :ok
+
+    assert Connection.validate_opts!(
+             timeout: :infinity,
+             max_frame_size: 0,
+             max_message_size: :infinity,
+             close_timeout: 0,
+             validate_utf8: false,
+             compress: true,
+             fullsweep_after: nil,
+             max_heap_size: %{size: 1_000_000},
+             connect_info: [:peer_data]
+           ) == :ok
+
+    for bad <- [
+          close_timeout: :infinity,
+          close_timeout: -1,
+          close_timeout: "50",
+          timeout: -5,
+          timeout: 1.5,
+          max_frame_size: :big,
+          max_message_size: -1,
+          validate_utf8: 1,
+          compress: nil,
+          fullsweep_after: -1,
+          max_heap_size: :lots
+        ] do
+      assert_raise ArgumentError, ~r/WebSocket option/, fn -> Connection.validate_opts!([bad]) end
+    end
+
+    assert_raise ArgumentError, ~r/keyword list/, fn -> Connection.validate_opts!(%{}) end
   end
 
   test "close payloads" do

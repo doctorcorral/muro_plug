@@ -130,13 +130,14 @@ dependency already) is what applications call.
   payload binary. Text, binary, continuation, ping (answered with a pong
   of the same payload before `handle_control/2`), pong, and close.
   Fragmented messages are reassembled with control frames allowed
-  between fragments. Text messages and close reasons must be UTF-8.
+  between fragments; every 1024 fragments are folded into one binary,
+  so many tiny fragments cannot pile up list cells. Text messages and close reasons must be UTF-8.
 * Failures close the connection with a close frame: 1002 for an
   unmasked frame, RSV bits (no extension is negotiated), a reserved
   opcode, a fragmented or over-125-byte control frame, an unexpected
   continuation or a data frame inside a fragmented message, a 1-byte
-  close or a close code that may not be sent, or a 64-bit length with
-  the high bit set; 1007 for invalid UTF-8; 1009 past
+  close or a close code that may not be sent, a 64-bit length with
+  the high bit set, or a length not in its minimal encoding (§5.2); 1007 for invalid UTF-8; 1009 past
   `:max_frame_size` (checked on the frame header) or
   `:max_message_size`.
 * `WebSock` callbacks: `init/1`, `handle_in/2`, `handle_control/2`
@@ -154,7 +155,11 @@ dependency already) is what applications call.
   (default 10_000_000), `:max_message_size` (default the frame limit),
   `:validate_utf8` (default `true`), `:close_timeout` (default 5_000
   ms), `:fullsweep_after`, `:max_heap_size`. `:compress` is accepted and
-  ignored: `permessage-deflate` is never advertised. A server shutdown
+  ignored: `permessage-deflate` is never advertised. A known option
+  with a bad value (e.g. `close_timeout: :infinity`) raises
+  `ArgumentError` from the upgrade, before the 101; unknown keys (Phoenix
+  passes its whole socket config) are ignored. An upgrade request whose
+  streamed body is still unread gets `400` and a close. A server shutdown
   closes open WebSockets with 1001.
 
 ## How it fits together
@@ -251,8 +256,10 @@ and `http:` + `https:` together, with `server_info/2` for each.
 the handshake and `Sec-WebSocket-Accept` (and RFC 6455's example),
 response headers on the 101, rejected upgrades (400/426), text and
 binary echo, 16- and 64-bit lengths, fragmentation with pings between
-fragments, one-byte packets, a first frame pipelined with the upgrade
-request, each 1002/1007/1009 failure above, `handle_info/2` pushes,
+fragments, 2000 one-byte fragments (exact reassembly, bounded state),
+one-byte packets, a first frame pipelined with the upgrade request, an
+upgrade with an unread streamed body, option validation, a client that
+never answers the server's close (`close_timeout`), each 1002/1007/1009 failure above, `handle_info/2` pushes,
 `handle_control/2`, `terminate/2` on client close, server stop,
 timeout, a dropped socket and server shutdown, close codes and reasons,
 a raising callback, and a `Phoenix.Endpoint` with both `http:` and

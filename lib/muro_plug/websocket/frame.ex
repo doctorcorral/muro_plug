@@ -50,7 +50,15 @@ defmodule MuroPlug.WebSocket.Frame do
   defp masked(1), do: :ok
   defp masked(0), do: {:error, 1002, :unmasked_frame}
 
+  # §5.2: the minimal number of octets must encode the length.
+  defp payload_length(126, <<len::16, _::binary>>) when len < 126,
+    do: {:error, 1002, :non_minimal_length}
+
   defp payload_length(126, <<len::16, rest::binary>>), do: {:ok, len, rest}
+
+  defp payload_length(127, <<0::1, len::63, _::binary>>) when len < 65_536,
+    do: {:error, 1002, :non_minimal_length}
+
   defp payload_length(127, <<0::1, len::63, rest::binary>>), do: {:ok, len, rest}
   defp payload_length(127, <<1::1, _::63, _::binary>>), do: {:error, 1002, :bad_length}
   defp payload_length(len, rest) when len < 126, do: {:ok, len, rest}
