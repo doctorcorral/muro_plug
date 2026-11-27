@@ -69,10 +69,11 @@ Phoenix endpoint passes its own), `:cipher_suite` (`:strong` or
 `:compatible`), `:ciphers`, `:versions`, `:eccs`, `:verify`,
 `:fail_if_no_peer_cert`, and `:alpn_preferred_protocols` (only
 `["http/1.1"]`, the default). TLS options inside
-`thousand_island_options: [transport_options: ...]` are used too. A
+`thousand_island_options: [transport_options: ...]` are used too, and
+top-level ones override them. `:ssl` is started before the listener. A
 bad `:scheme`, a missing key or certificate, a missing file, other
-ALPN protocols, or TLS options with `scheme: :http` raise
-`ArgumentError`.
+ALPN protocols, or TLS options with `scheme: :http` (top-level or in
+`:transport_options`) raise `ArgumentError`.
 
 The handler and adapter are the same on both transports: Thousand
 Island finishes the handshake, and every read and write is

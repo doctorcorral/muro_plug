@@ -26,7 +26,8 @@ defmodule MuroPlug.TestClient do
     opts =
       Keyword.merge([active: false, packet: :raw] ++ MuroPlug.TestCert.client_options(), opts)
 
-    {:ok, s} = :ssl.connect(~c"localhost", port, [:binary | opts], 5_000)
+    # The servers listen on IPv4; the certificate's SAN has IP:127.0.0.1.
+    {:ok, s} = :ssl.connect({127, 0, 0, 1}, port, [:binary | opts], 5_000)
     {:tls, s}
   end
 

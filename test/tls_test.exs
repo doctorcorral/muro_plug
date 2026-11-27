@@ -22,6 +22,12 @@ defmodule MuroPlug.TLSTest do
       send_resp(conn, 200, ["body=", body])
     end
 
+    # Tells the test the plug runs, so the body is being streamed.
+    defp route(_, ["size_tell"], conn, opts) do
+      send(opts[:test], :streaming)
+      route("POST", ["size"], conn, opts)
+    end
+
     defp route(_, ["size"], conn, _) do
       {:ok, body, conn} = read_all(conn, [])
       send_resp(conn, 200, Integer.to_string(byte_size(body)) <> ":" <> hash(body))
@@ -309,18 +315,20 @@ defmodule MuroPlug.TLSTest do
   end
 
   test "a streamed chunked total past max_body is the book's 413 over TLS" do
-    port = serve({App, []}, TestCert.server_options() ++ [max_body: 30_000])
+    port = serve({App, test: self()}, TestCert.server_options() ++ [max_body: 30_000])
     s = connect_tls(port)
     hex = Integer.to_string(20_000, 16)
 
     :ok =
       send_bytes(
         s,
-        "POST /size HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n" <>
+        "POST /size_tell HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n" <>
           hex <> "\r\n" <> String.duplicate("a", 20_000)
       )
 
-    Process.sleep(50)
+    # The plug runs before the body ends: the book handed it to the
+    # host to stream. Only then does the second chunk pass max_body.
+    assert_receive :streaming, 2_000
     :ok = send_bytes(s, "\r\n" <> hex <> "\r\n" <> String.duplicate("b", 20_000))
     {{:ok, r, ""}, log} = ExUnit.CaptureLog.with_log(fn -> read(s) end)
     assert {r.status, header(r, "connection")} == {413, "close"}
@@ -361,6 +369,59 @@ defmodule MuroPlug.TLSTest do
     ti = [transport_options: [certfile: TestCert.certfile(), keyfile: TestCert.keyfile()]]
     port = serve({App, []}, scheme: :https, thousand_island_options: ti)
     assert request_tls(port, "GET /ti HTTP/1.1\r\nHost: h\r\n\r\n").body == "GET /ti"
+  end
+
+  test "top-level TLS options override transport_options" do
+    ti = [transport_options: [certfile: "/nope/cert.pem", keyfile: "/nope/key.pem"]]
+    opts = TestCert.server_options() ++ [thousand_island_options: ti]
+    tls = MuroPlug.thousand_island_options([plug: App] ++ opts)[:transport_options]
+    assert tls[:certfile] == String.to_charlist(TestCert.certfile())
+    assert tls[:keyfile] == String.to_charlist(TestCert.keyfile())
+    assert length(Keyword.get_values(tls, :certfile)) == 1
+    port = serve({App, []}, opts)
+    assert request_tls(port, "GET /top HTTP/1.1\r\nHost: h\r\n\r\n").body == "GET /top"
+  end
+
+  test ":certs_keys serves, with relative files resolved against :otp_app" do
+    app = Application.app_dir(:muro_plug)
+
+    # A "../../.." path from the app dir to the temp cert.
+    relative = Path.relative_to(TestCert.certfile(), app, force: true)
+    assert Path.type(relative) == :relative
+    certs_keys = [%{certfile: relative, keyfile: TestCert.keyfile()}]
+
+    opts = [scheme: :https, otp_app: :muro_plug, certs_keys: certs_keys]
+    tls = MuroPlug.thousand_island_options([plug: App] ++ opts)[:transport_options]
+    refute Keyword.has_key?(tls, :otp_app)
+    assert [%{certfile: certfile, keyfile: keyfile}] = tls[:certs_keys]
+    assert certfile == String.to_charlist(TestCert.certfile())
+    assert keyfile == String.to_charlist(TestCert.keyfile())
+
+    port = serve({App, []}, opts)
+    assert request_tls(port, "GET /ck HTTP/1.1\r\nHost: h\r\n\r\n").body == "GET /ck"
+  end
+
+  test ":sni_hosts and :sni_fun satisfy the key and certificate checks" do
+    host = [certfile: TestCert.certfile(), keyfile: TestCert.keyfile()]
+    sni_fun = fn _ -> host end
+
+    for sni <- [[sni_hosts: [{~c"localhost", host}]], [sni_fun: sni_fun]] do
+      opts = [scheme: :https, otp_app: :muro_plug] ++ sni
+      ti = MuroPlug.thousand_island_options([plug: App] ++ opts)
+      assert ti[:transport_module] == ThousandIsland.Transports.SSL
+      tls = ti[:transport_options]
+      refute Keyword.has_key?(tls, :otp_app)
+      assert Keyword.take(tls, [:sni_hosts, :sni_fun]) == sni
+      assert %{start: {ThousandIsland, :start_link, _}} = MuroPlug.child_spec([plug: App] ++ opts)
+    end
+
+    port = serve({App, []}, scheme: :https, sni_fun: sni_fun)
+
+    s =
+      connect_tls(port, server_name_indication: ~c"localhost")
+
+    :ok = send_bytes(s, "GET /sni HTTP/1.1\r\nHost: localhost\r\n\r\n")
+    assert {:ok, %{body: "GET /sni"}, ""} = read(s)
   end
 
   describe "option errors" do
@@ -412,6 +473,19 @@ defmodule MuroPlug.TLSTest do
       assert_raise ArgumentError, ~r/\[:certfile, :keyfile\] need scheme: :https/, fn ->
         opts!(certfile: TestCert.certfile(), keyfile: TestCert.keyfile())
       end
+
+      ti = [transport_options: [certfile: TestCert.certfile(), keyfile: TestCert.keyfile()]]
+
+      assert_raise ArgumentError, ~r/\[:certfile, :keyfile\] need scheme: :https/, fn ->
+        opts!(scheme: :http, thousand_island_options: ti)
+      end
+
+      assert_raise ArgumentError, ~r/\[:otp_app\] need scheme: :https/, fn ->
+        opts!(thousand_island_options: [transport_options: [otp_app: :muro_plug]])
+      end
+
+      # A top-level :otp_app (as Phoenix configs carry) is fine under :http.
+      assert opts!(otp_app: :muro_plug)[:transport_module] == ThousandIsland.Transports.TCP
     end
 
     test "the transport and its options" do
@@ -479,7 +553,7 @@ defmodule MuroPlug.TLSPlugRouterTest do
 
   test "a Plug.Router app served over HTTPS through :httpc" do
     port = MuroPlug.TestClient.serve(Router, TestCert.server_options())
-    url = fn path -> ~c"https://localhost:#{port}#{path}" end
+    url = fn path -> ~c"https://127.0.0.1:#{port}#{path}" end
     http = [ssl: TestCert.client_options()]
 
     assert {:ok, {{_, 200, _}, _, ~c"hello tls over https"}} =
@@ -580,16 +654,16 @@ defmodule MuroPlug.TLSPhoenixTest do
     assert {:ok, https_pid} = MuroPlug.PhoenixAdapter.server_pid(Endpoint, :https)
     assert http_pid != https_pid
 
-    assert {:ok, {{_, 200, _}, _, body}} = get(~c"http://localhost:#{http}/")
+    assert {:ok, {{_, 200, _}, _, body}} = get(~c"http://127.0.0.1:#{http}/")
     assert to_string(body) == "http #{http}"
-    assert {:ok, {{_, 200, _}, _, body}} = get(~c"https://localhost:#{https}/")
+    assert {:ok, {{_, 200, _}, _, body}} = get(~c"https://127.0.0.1:#{https}/")
     assert to_string(body) == "https #{https}"
   end
 
   test "an https:-only endpoint with DER :cert and :key" do
     assert {:error, :no_server_found} = HTTPSOnly.server_info(:http)
     {:ok, {_, port}} = HTTPSOnly.server_info(:https)
-    assert {:ok, {{_, 200, _}, _, body}} = get(~c"https://localhost:#{port}/")
+    assert {:ok, {{_, 200, _}, _, body}} = get(~c"https://127.0.0.1:#{port}/")
     assert to_string(body) == "https #{port}"
   end
 

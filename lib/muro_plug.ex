@@ -53,8 +53,13 @@ defmodule MuroPlug do
   `:certs_keys`, or SNI) are required. The server speaks HTTP/1.1 only,
   so ALPN advertises `"http/1.1"` and no other protocol may be listed.
 
+  TLS options may also sit in `thousand_island_options:
+  [transport_options: ...]`; top-level ones win. `:ssl` is started
+  before the listener.
+
   An invalid `:scheme`, missing TLS key or certificate, or TLS options
-  given with `scheme: :http` raise `ArgumentError`.
+  given with `scheme: :http` (top-level or in `:transport_options`)
+  raise `ArgumentError`.
 
   For Phoenix, see `MuroPlug.PhoenixAdapter`.
   """
@@ -146,8 +151,15 @@ defmodule MuroPlug do
     end
   end
 
+  # TLS options under :http would serve plain HTTP, or fail in
+  # :gen_tcp. A top-level :otp_app is harmless; in transport_options it
+  # would reach :gen_tcp, so it is refused there too.
   defp transport(:http, opts, transport) do
-    case Keyword.keys(Keyword.take(opts, @tls_options -- [:otp_app])) do
+    keys =
+      Keyword.keys(Keyword.take(opts, @tls_options -- [:otp_app])) ++
+        Keyword.keys(Keyword.take(transport, @tls_options))
+
+    case Enum.uniq(keys) do
       [] ->
         {ThousandIsland.Transports.TCP, transport, 4000}
 
@@ -157,7 +169,10 @@ defmodule MuroPlug do
     end
   end
 
+  # Top-level TLS options override the same keys in transport_options.
   defp transport(:https, opts, transport) do
+    # As Plug.Cowboy.https/3: :ssl must run before the SSL listener.
+    {:ok, _} = Application.ensure_all_started(:ssl)
     tls = Keyword.merge(transport, Keyword.take(opts, @tls_options))
 
     case Keyword.get(tls, :alpn_preferred_protocols, @alpn) do
