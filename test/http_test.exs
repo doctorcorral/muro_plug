@@ -36,6 +36,24 @@ defmodule MuroPlug.HTTPTest do
     defp route("GET", ["file"], conn), do: send_file(conn, 200, __ENV__.file, 0, 100)
     defp route("GET", ["file_off"], conn), do: send_file(conn, 200, __ENV__.file, 10, :all)
 
+    defp route("GET", ["file_past"], conn),
+      do: send_file(conn, 200, __ENV__.file, 10_000_000, :all)
+
+    defp route("GET", ["file_broken"], conn) do
+      {MuroPlug.Adapter, p} = conn.adapter
+      :gen_tcp.close(p.socket.socket)
+      conn = send_file(conn, 200, __ENV__.file, 0, :all)
+      {MuroPlug.Adapter, p} = conn.adapter
+      send(conn.private[:test] || self(), {:file_broken, p.resp})
+      conn
+    end
+
+    defp route("GET", ["teapot_keep"], conn) do
+      conn |> put_resp_header("connection", "keep-alive") |> send_resp(418, "tea")
+    end
+
+    defp route("POST", ["ignore"], conn), do: send_resp(conn, 200, "did not read")
+
     defp route("GET", ["close"], conn),
       do: conn |> put_resp_header("connection", "close") |> send_resp(200, "bye")
 
@@ -425,5 +443,124 @@ defmodule MuroPlug.HTTPTest do
     port = serve(App, idle_timeout: 100)
     s = connect(port)
     assert closed?(s, 2_000)
+  end
+
+  describe "review fixes" do
+    # A chunk of 20000 bytes puts the chunk tail past 16384, so the book
+    # hands the body to the host to stream (status ok, reply span).
+    @big 20_000
+    @big_hex Integer.to_string(@big, 16)
+
+    defp streamed_chunked(port, after_first) do
+      s = connect(port)
+
+      :ok =
+        :gen_tcp.send(
+          s,
+          "POST /size HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n" <>
+            @big_hex <> "\r\n" <> String.duplicate("a", @big)
+        )
+
+      Process.sleep(50)
+      :ok = :gen_tcp.send(s, after_first)
+      s
+    end
+
+    test "a streamed chunked body with bad framing is the book's 400, then close", %{port: port} do
+      s = streamed_chunked(port, "\r\nzz\r\nxx\r\n0\r\n\r\n")
+      {r, log} = ExUnit.CaptureLog.with_log(fn -> read(s) end)
+      assert {:ok, %{status: 400} = r, ""} = r
+      assert header(r, "connection") == "close"
+      assert closed?(s)
+      refute log =~ "[error]"
+    end
+
+    test "a streamed chunked body with a bare LF is 400", %{port: port} do
+      s = streamed_chunked(port, "\n0\r\n\r\n")
+      {{:ok, r, ""}, _} = ExUnit.CaptureLog.with_log(fn -> read(s) end)
+      assert r.status == 400
+      assert closed?(s)
+    end
+
+    test "a streamed chunked total past max_body is the book's 413, then close" do
+      port = serve(App, max_body: 30_000)
+      s = streamed_chunked(port, "\r\n" <> @big_hex <> "\r\n" <> String.duplicate("b", @big))
+      {{:ok, r, ""}, log} = ExUnit.CaptureLog.with_log(fn -> read(s) end)
+      assert r.status == 413
+      assert header(r, "connection") == "close"
+      assert closed?(s)
+      refute log =~ "[error]"
+    end
+
+    test "a buffered chunk with a bare LF is the book's 400", %{port: port} do
+      req =
+        "POST /echo HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n3\nabc\r\n0\r\n\r\n"
+
+      assert request(port, req).status == 400
+    end
+
+    test "a Plug connection: keep-alive is replaced by close when the book closes", %{port: port} do
+      s = connect(port)
+      :ok = :gen_tcp.send(s, "GET /teapot_keep HTTP/1.1\r\nHost: h\r\n\r\n")
+      {:ok, r, ""} = read(s)
+      assert r.status == 418
+      assert for({"connection", v} <- r.headers, do: v) == ["close"]
+      assert closed?(s)
+    end
+
+    test "an unread streamed body forces Connection: close", %{port: port} do
+      s = connect(port)
+
+      :ok =
+        :gen_tcp.send(
+          s,
+          "POST /ignore HTTP/1.1\r\nHost: h\r\nContent-Length: 100000\r\n\r\n" <>
+            String.duplicate("x", 20_000)
+        )
+
+      {:ok, r, ""} = read(s)
+      assert {r.status, r.body} == {200, "did not read"}
+      assert header(r, "connection") == "close"
+      assert closed?(s)
+    end
+
+    test "send_file on a broken socket does not crash and the handler closes" do
+      test = self()
+      s = connect(serve({__MODULE__.Tagged, {App, test}}))
+
+      {_, log} =
+        ExUnit.CaptureLog.with_log(fn ->
+          :ok = :gen_tcp.send(s, "GET /file_broken HTTP/1.1\r\nHost: h\r\n\r\n")
+          assert_receive {:file_broken, {:failed, _out}}, 2_000
+          assert closed?(s)
+        end)
+
+      refute log =~ "MatchError"
+      refute log =~ "[error]"
+    end
+
+    test "send_file with an offset past EOF sends an empty body and keeps the connection",
+         %{port: port} do
+      s = connect(port)
+      :ok = :gen_tcp.send(s, "GET /file_past HTTP/1.1\r\nHost: h\r\n\r\n")
+      assert {:ok, %{status: 200, body: ""} = r, ""} = read(s)
+      assert header(r, "content-length") == "0"
+      :ok = :gen_tcp.send(s, "GET /next HTTP/1.1\r\nHost: h\r\n\r\n")
+      assert {:ok, %{body: "GET /next"}, ""} = read(s)
+    end
+
+    test "an HTTP/1.0 request gets an HTTP/1.0 status line", %{port: port} do
+      r = request(port, "GET /old HTTP/1.0\r\n\r\n")
+      assert r.version == "HTTP/1.0"
+      assert r.raw_head =~ ~r/\AHTTP\/1\.0 200 OK\r\n/
+    end
+  end
+
+  defmodule Tagged do
+    # Runs App with the test pid in conn.private.
+    def init({app, test}), do: {app.init([]), app, test}
+
+    def call(conn, {opts, app, test}),
+      do: conn |> Plug.Conn.put_private(:test, test) |> app.call(opts)
   end
 end

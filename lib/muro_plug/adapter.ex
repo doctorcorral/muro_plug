@@ -34,9 +34,21 @@ defmodule MuroPlug.Adapter do
   @type t :: %__MODULE__{}
 
   @sent_key {__MODULE__, :sent}
+  @body_error_key {__MODULE__, :body_error}
 
   @doc false
   def sent_key, do: @sent_key
+
+  @doc false
+  # How a streamed request body failed during this request, if it did:
+  # `{:status, 400 | 413}` or `{:abort, reason}`. The Plug contract's
+  # `{:error, reason}` carries no payload, so the handler reads it here.
+  def body_error_key, do: @body_error_key
+
+  defp body_error(e), do: Process.put(@body_error_key, e)
+
+  defp status_of(:too_large), do: 413
+  defp status_of(_bad_chunk), do: 400
 
   ## Responses
 
@@ -49,7 +61,8 @@ defmodule MuroPlug.Adapter do
     length =
       if bodyless, do: [], else: [{"content-length", Integer.to_string(IO.iodata_length(body))}]
 
-    head = HTTP.head(status, headers, length ++ framing(p, out, headers))
+    {headers, extra} = framing(out, headers)
+    head = HTTP.head(version(p), status, headers, length ++ extra)
     data = if bodyless or p.head, do: head, else: [head, body]
     write(p, out, data, :done)
   end
@@ -58,28 +71,37 @@ defmodule MuroPlug.Adapter do
   def send_file(%__MODULE__{} = p, status, headers, path, offset, length) do
     length =
       case length do
-        :all -> File.stat!(path).size - offset
+        # An offset past the end of the file is an empty body.
+        :all -> max(File.stat!(path).size - offset, 0)
         n when is_integer(n) -> n
       end
 
     out = hand(p, status, headers, 1)
     headers = drop(headers, ["content-length", "transfer-encoding"])
-    extra = [{"content-length", Integer.to_string(length)} | framing(p, out, headers)]
-    head = HTTP.head(status, headers, extra)
+    {headers, extra} = framing(out, headers)
 
-    with {:ok, nil, p} <- write(p, out, head, :done) do
-      if p.head or bodyless?(status) or length == 0 do
-        {:ok, nil, p}
-      else
-        case Socket.sendfile(p.socket, path, offset, length) do
-          {:ok, _} ->
-            {:done, ^out, n} = p.resp
-            {:ok, nil, %{p | resp: {:done, out, n + length}}}
+    head =
+      HTTP.head(version(p), status, headers, [
+        {"content-length", Integer.to_string(length)} | extra
+      ])
 
-          {:error, _} ->
-            {:ok, nil, %{p | resp: {:failed, out}}}
+    {:ok, nil, p} = write(p, out, head, :done)
+
+    case p.resp do
+      {:done, out, n} when length > 0 ->
+        if p.head or bodyless?(status) do
+          {:ok, nil, p}
+        else
+          case Socket.sendfile(p.socket, path, offset, length) do
+            {:ok, _} -> {:ok, nil, %{p | resp: {:done, out, n + length}}}
+            {:error, _} -> {:ok, nil, %{p | resp: {:failed, out}}}
+          end
         end
-      end
+
+      # A header write that failed stays failed: the handler feeds the
+      # book a write failure and closes. Nothing more is sent.
+      _ ->
+        {:ok, nil, p}
     end
   end
 
@@ -88,7 +110,8 @@ defmodule MuroPlug.Adapter do
     out = hand(p, status, headers, 2)
     headers = drop(headers, ["content-length", "transfer-encoding"])
     te = if out.span == 4, do: [{"transfer-encoding", "chunked"}], else: []
-    write(p, out, HTTP.head(status, headers, te ++ framing(p, out, headers)), :chunked)
+    {headers, extra} = framing(out, headers)
+    write(p, out, HTTP.head(version(p), status, headers, te ++ extra), :chunked)
   end
 
   @impl true
@@ -116,7 +139,7 @@ defmodule MuroPlug.Adapter do
 
   @impl true
   def inform(%__MODULE__{http11: true} = p, status, headers) do
-    case Socket.send(p.socket, HTTP.head(status, normalize(headers), [])) do
+    case Socket.send(p.socket, HTTP.head(:"HTTP/1.1", status, normalize(headers), [])) do
       :ok -> :ok
       {:error, reason} -> {:error, reason}
     end
@@ -172,6 +195,7 @@ defmodule MuroPlug.Adapter do
         read_cl(p, [acc | data], got + k, rem - k, len, step, timeout)
 
       {:error, reason} ->
+        body_error({:abort, reason})
         {:error, reason}
     end
   end
@@ -179,7 +203,12 @@ defmodule MuroPlug.Adapter do
   defp read_chunked(p, {:done, data, rest}, acc, _got, _len, _timeout),
     do: {:ok, IO.iodata_to_binary([acc | data]), %{p | body: :done, leftover: rest}}
 
-  defp read_chunked(_p, {:error, reason}, _acc, _got, _len, _timeout), do: {:error, reason}
+  # Bad framing or a total past max on a streamed body: the handler
+  # owes the book's overStatus (400 or 413) when nothing was sent.
+  defp read_chunked(_p, {:error, reason}, _acc, _got, _len, _timeout) do
+    body_error({:status, status_of(reason)})
+    {:error, reason}
+  end
 
   defp read_chunked(p, {:more, data, dec}, acc, got, len, timeout) do
     acc = [acc | data]
@@ -189,8 +218,12 @@ defmodule MuroPlug.Adapter do
       {:more, IO.iodata_to_binary(acc), %{p | body: {:chunked, dec, <<>>}}}
     else
       case Socket.recv(p.socket, 0, timeout) do
-        {:ok, bytes} -> read_chunked(p, Chunked.feed(dec, bytes), acc, got, len, timeout)
-        {:error, reason} -> {:error, reason}
+        {:ok, bytes} ->
+          read_chunked(p, Chunked.feed(dec, bytes), acc, got, len, timeout)
+
+        {:error, reason} ->
+          body_error({:abort, reason})
+          {:error, reason}
       end
     end
   end
@@ -241,20 +274,25 @@ defmodule MuroPlug.Adapter do
     end
   end
 
-  defp framing(_p, out, headers) do
+  # Host headers for the book's verdict. keep 1 closes the socket, so
+  # any Plug-supplied Connection header is replaced by `close`.
+  defp framing(out, headers) do
     date = if List.keymember?(headers, "date", 0), do: [], else: [{"date", HTTP.date()}]
 
-    conn =
-      if out.keep == 1 and not List.keymember?(headers, "connection", 0),
-        do: [{"connection", "close"}],
-        else: []
-
-    date ++ conn
+    if out.keep == 1 do
+      {Enum.reject(headers, fn {k, _} -> String.downcase(k) == "connection" end),
+       date ++ [{"connection", "close"}]}
+    else
+      {headers, date}
+    end
   end
+
+  defp version(%__MODULE__{http11: true}), do: :"HTTP/1.1"
+  defp version(%__MODULE__{}), do: :"HTTP/1.0"
 
   defp close_header?(headers) do
     Enum.any?(headers, fn {k, v} ->
-      k == "connection" and v |> String.downcase() |> String.contains?("close")
+      String.downcase(k) == "connection" and v |> String.downcase() |> String.contains?("close")
     end)
   end
 

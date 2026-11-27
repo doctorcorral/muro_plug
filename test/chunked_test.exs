@@ -28,6 +28,15 @@ defmodule MuroPlug.ChunkedTest do
     assert {data, rest} == {"abc0123456789", "NEXT"}
   end
 
+  test "line endings are strict CRLF, as in the book's chunkScan" do
+    assert {:error, :bad_chunk} = Chunked.feed(Chunked.new(), "3\nabc\r\n")
+    assert {:error, :bad_chunk} = Chunked.feed(Chunked.new(), "3\r\nabc\n0\r\n\r\n")
+    assert {:error, :bad_chunk} = Chunked.feed(Chunked.new(), "0\r\nT: 1\n\r\n")
+    assert {:error, :bad_chunk} = Chunked.feed(Chunked.new(), "\n")
+    assert {:more, [], _} = Chunked.feed(Chunked.new(), "3\r")
+    assert {:ok, "abc", ""} = Chunked.decode_all("3\r\nabc\r\n0\r\n\r\n")
+  end
+
   test "rejects bad sizes and enforces max" do
     assert {:error, :bad_chunk} = Chunked.feed(Chunked.new(), "zz\r\n")
     assert {:error, :bad_chunk} = Chunked.feed(Chunked.new(), "+3\r\nabc\r\n")

@@ -27,7 +27,7 @@ defmodule MuroPlug.Handler do
 
   @impl ThousandIsland.Handler
   def handle_connection(socket, opts) do
-    cfg = %{max_body: opts.max_body, idle: opts.idle_timeout, deadline: 0}
+    cfg = %{max_body: opts.max_body, idle: opts.idle_timeout}
     out = Book.step(Book.read_st(), :accepted, <<>>, cfg)
 
     state = %{
@@ -87,9 +87,13 @@ defmodule MuroPlug.Handler do
         act(Book.step(Book.take(out), :wrote, state.buf, state.cfg, n, n), socket, state)
 
       {:error, _} ->
-        {:close, state}
+        failed(out, socket, state)
     end
   end
+
+  # A write failed: the book's write-failed fact (quiet, so it closes).
+  defp failed(out, socket, state),
+    do: act(Book.step(Book.take(out), :failed, state.buf, state.cfg), socket, state)
 
   ## One finished request
 
@@ -119,6 +123,7 @@ defmodule MuroPlug.Handler do
         headers = HTTP.headers(binary_part(buf, 0, hend))
         conn = build_conn(payload, views, headers, state)
         Process.delete(Adapter.sent_key())
+        Process.delete(Adapter.body_error_key())
 
         result = call_plug(conn, state.plug)
         reply = finish(result, req, tail, socket, state)
@@ -164,7 +169,35 @@ defmodule MuroPlug.Handler do
     do: finish({:ok, Plug.Conn.send_resp(conn)}, req, tail, socket, state)
 
   defp finish({:ok, %Plug.Conn{adapter: {Adapter, p}}}, req, tail, socket, state) do
-    case p.resp do
+    case {p.resp, Process.get(Adapter.body_error_key())} do
+      {:unsent, error} when error != nil -> body_failed(error, req, socket, state)
+      {resp, _} -> answered(resp, p, req, tail, socket, state)
+    end
+  end
+
+  defp finish({:raised, kind, reason, stack}, req, _tail, socket, state) do
+    error = Process.get(Adapter.body_error_key())
+
+    if error == nil and status_of(kind, reason) >= 500,
+      do: Logger.error(Exception.format(kind, reason, stack), crash_reason: {reason, stack})
+
+    cond do
+      Process.get(Adapter.sent_key()) -> {:close, state}
+      error != nil -> body_failed(error, req, socket, state)
+      true -> refuse(req, socket, state)
+    end
+  end
+
+  # A streamed body failed and nothing was sent. Bad framing or a total
+  # past max is the book's overStatus span (400 or 413, then close). A
+  # socket error mid-body has no status: close.
+  defp body_failed({:status, code}, req, socket, state),
+    do: act(Book.over_status(req, code), socket, state)
+
+  defp body_failed({:abort, _reason}, _req, _socket, state), do: {:close, state}
+
+  defp answered(resp, p, req, tail, socket, state) do
+    case resp do
       {:done, out, n} ->
         wrote(out, n, p, tail, socket, state)
 
@@ -173,23 +206,16 @@ defmodule MuroPlug.Handler do
 
         case Socket.send(socket, last) do
           :ok -> wrote(out, n + byte_size(last), p, tail, socket, state)
-          {:error, _} -> {:close, state}
+          {:error, _} -> failed(out, socket, state)
         end
 
-      {:failed, _} ->
-        {:close, state}
+      {:failed, out} ->
+        failed(out, socket, state)
 
       :unsent ->
         Logger.error("MuroPlug: #{inspect(elem(state.plug, 0))} returned without a response")
         refuse(req, socket, state)
     end
-  end
-
-  defp finish({:raised, kind, reason, stack}, req, _tail, socket, state) do
-    if status_of(kind, reason) >= 500,
-      do: Logger.error(Exception.format(kind, reason, stack), crash_reason: {reason, stack})
-
-    if Process.get(Adapter.sent_key()), do: {:close, state}, else: refuse(req, socket, state)
   end
 
   # A handler that did not answer: the book's `hand` with href 1 and

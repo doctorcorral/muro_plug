@@ -113,5 +113,5 @@ defmodule MuroPlug.BinaryTest do
     assert binary_part(Step.postBody(), req.hend, req.cl) == "abcd"
   end
 
-  defp cfg, do: %{max_body: 16_384, idle: 60_000, deadline: 0}
+  defp cfg, do: %{max_body: 16_384, idle: 60_000}
 end

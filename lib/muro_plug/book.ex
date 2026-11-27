@@ -51,11 +51,18 @@ defmodule MuroPlug.Book do
   @spec read_st() :: st()
   def read_st, do: Step.readSt()
 
-  @doc "Feed one fact to the book. `fact` is an atom; `buf` the unconsumed buffer."
+  @doc """
+  Feed one fact to the book. `fact` is an atom; `buf` the unconsumed buffer.
+
+  The carried deadline is always 0, so the book arms `now + idle` on
+  each read. Thousand Island's `read_timeout` is that same idle budget
+  and delivers the NOW fact (`MuroPlug.Handler.handle_timeout/2`), so
+  the book's `wake` is not re-armed by the host.
+  """
   @spec step(st(), atom(), binary(), map(), non_neg_integer(), non_neg_integer()) :: out()
   def step(st, fact, buf, cfg, n \\ 0, owed \\ 0) when is_binary(buf) do
     st
-    |> Step.stepFact(code(fact), buf, cfg.max_body, n, owed, now(), cfg.deadline, cfg.idle)
+    |> Step.stepFact(code(fact), buf, cfg.max_body, n, owed, now(), 0, cfg.idle)
     |> out()
   end
 
@@ -85,6 +92,15 @@ defmodule MuroPlug.Book do
     )
     |> out()
   end
+
+  @doc """
+  The protocol span a failed body read owes after a successful handler
+  (`overStatus` in step.muro): 400 or 413 owes that status and closes;
+  any other code is outside (`cover` 1), and the host shuts.
+  """
+  @spec over_status(out(), non_neg_integer()) :: out()
+  def over_status(%{} = req, code),
+    do: code |> Step.overStatus(req.hend, req.te, req.saw_cl, req.cl) |> out()
 
   @doc "The book's `St` for an `Out` (`take` in step.muro)."
   @spec take(out()) :: st()

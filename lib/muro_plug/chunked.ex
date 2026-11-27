@@ -2,6 +2,10 @@ defmodule MuroPlug.Chunked do
   @moduledoc """
   An incremental `Transfer-Encoding: chunked` request-body decoder.
 
+  Line endings are strict CRLF, as in the book's chunkScan: a bare LF
+  in a size line, after chunk data, or in a trailer is `:bad_chunk`
+  (step.muro's chunk-trailer-bare and chunk-ext-lf owe 400).
+
   The book validates chunk framing for a body it buffers (chunkScan)
   and owes 400 or 413 itself. A body the book hands to the host to
   stream (a chunk tail past 16384 bytes) is decoded here as it is read
@@ -41,6 +45,9 @@ defmodule MuroPlug.Chunked do
 
   defp run(%{state: :size, pending: p} = dec, acc) do
     case line(p) do
+      :bad ->
+        {:error, :bad_chunk}
+
       {:ok, l, rest} ->
         case size(l) do
           {:ok, 0} -> run(%{dec | state: :trailers, pending: rest}, acc)
@@ -73,7 +80,6 @@ defmodule MuroPlug.Chunked do
   defp run(%{state: :data_end, pending: p} = dec, acc) do
     case p do
       <<"\r\n", rest::binary>> -> run(%{dec | state: :size, pending: rest}, acc)
-      <<"\n", rest::binary>> -> run(%{dec | state: :size, pending: rest}, acc)
       <<"\r">> -> {:more, Enum.reverse(acc), dec}
       <<>> -> {:more, Enum.reverse(acc), dec}
       _ -> {:error, :bad_chunk}
@@ -82,6 +88,7 @@ defmodule MuroPlug.Chunked do
 
   defp run(%{state: :trailers, pending: p} = dec, acc) do
     case line(p) do
+      :bad -> {:error, :bad_chunk}
       {:ok, <<>>, rest} -> {:done, Enum.reverse(acc), rest}
       {:ok, _trailer, rest} -> run(%{dec | pending: rest}, acc)
       :more when byte_size(p) > @max_line -> {:error, :bad_chunk}
@@ -95,17 +102,19 @@ defmodule MuroPlug.Chunked do
       else: run(%{dec | total: t + n}, acc)
   end
 
+  # One CRLF-terminated line. A LF without a CR before it is bad.
   defp line(p) do
-    case :binary.split(p, "\n") do
-      [l, rest] -> {:ok, strip_cr(l), rest}
-      [_] -> :more
-    end
-  end
+    case :binary.match(p, "\n") do
+      :nomatch ->
+        :more
 
-  defp strip_cr(l) do
-    case byte_size(l) do
-      0 -> l
-      k -> if :binary.last(l) == ?\r, do: binary_part(l, 0, k - 1), else: l
+      {0, 1} ->
+        :bad
+
+      {pos, 1} ->
+        if :binary.at(p, pos - 1) == ?\r,
+          do: {:ok, binary_part(p, 0, pos - 1), binary_part(p, pos + 1, byte_size(p) - pos - 1)},
+          else: :bad
     end
   end
 

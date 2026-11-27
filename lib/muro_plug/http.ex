@@ -66,11 +66,16 @@ defmodule MuroPlug.HTTP do
     end
   end
 
-  @doc "Status line and headers. `extra` are host headers added before Plug's."
-  @spec head(Plug.Conn.status(), Plug.Conn.headers(), [{binary(), binary()}]) :: iodata()
-  def head(status, headers, extra) do
+  @doc """
+  Status line and headers. `extra` are host headers added before Plug's.
+  An HTTP/1.0 request gets an `HTTP/1.0` status line.
+  """
+  @spec head(:"HTTP/1.1" | :"HTTP/1.0", Plug.Conn.status(), Plug.Conn.headers(), [
+          {binary(), binary()}
+        ]) :: iodata()
+  def head(version, status, headers, extra) do
     [
-      "HTTP/1.1 ",
+      if(version == :"HTTP/1.0", do: "HTTP/1.0 ", else: "HTTP/1.1 "),
       Integer.to_string(status),
       ?\s,
       reason(status),
@@ -83,7 +88,11 @@ defmodule MuroPlug.HTTP do
   @doc "A protocol status the book owes: no body, and the connection closes."
   @spec status_close(non_neg_integer()) :: iodata()
   def status_close(code) do
-    head(code, [], [{"content-length", "0"}, {"connection", "close"}, {"date", date()}])
+    head(:"HTTP/1.1", code, [], [
+      {"content-length", "0"},
+      {"connection", "close"},
+      {"date", date()}
+    ])
   end
 
   @doc "The `100 Continue` interim (span 6)."

@@ -35,7 +35,8 @@ defmodule MuroPlug.TestClient do
 
     with {:ok, head, rest} <- head(s, buf, timeout) do
       [status_line | lines] = :binary.split(head, "\r\n", [:global])
-      ["HTTP/1.1", code | _] = String.split(status_line, " ", parts: 3)
+      [version, code | _] = String.split(status_line, " ", parts: 3)
+      true = version in ["HTTP/1.1", "HTTP/1.0"]
 
       headers =
         for l <- lines, l != "" do
@@ -44,7 +45,7 @@ defmodule MuroPlug.TestClient do
         end
 
       status = String.to_integer(code)
-      resp = %{status: status, headers: headers, body: <<>>, raw_head: head}
+      resp = %{status: status, version: version, headers: headers, body: <<>>, raw_head: head}
       no_body = Keyword.get(opts, :head, false) or status in 100..199 or status in [204, 304]
 
       cond do
