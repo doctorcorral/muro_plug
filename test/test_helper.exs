@@ -4,6 +4,8 @@ ExUnit.start()
 defmodule MuroPlug.TestClient do
   @moduledoc false
   # A raw HTTP/1.1 client over :gen_tcp, so tests see the exact wire.
+  # A TLS socket from `connect_tls/2` is `{:tls, sslsocket}`; `read/3`,
+  # `send_bytes/2`, and `closed?/2` take either.
 
   def serve(plug, opts \\ []) do
     pid =
@@ -20,6 +22,15 @@ defmodule MuroPlug.TestClient do
     s
   end
 
+  def connect_tls(port, opts \\ []) do
+    opts =
+      Keyword.merge([active: false, packet: :raw] ++ MuroPlug.TestCert.client_options(), opts)
+
+    # The servers listen on IPv4; the certificate's SAN has IP:127.0.0.1.
+    {:ok, s} = :ssl.connect({127, 0, 0, 1}, port, [:binary | opts], 5_000)
+    {:tls, s}
+  end
+
   def request(port, data, opts \\ []) do
     s = connect(port)
     :ok = :gen_tcp.send(s, data)
@@ -27,6 +38,23 @@ defmodule MuroPlug.TestClient do
     :gen_tcp.close(s)
     resp
   end
+
+  def request_tls(port, data, opts \\ []) do
+    s = connect_tls(port)
+    :ok = send_bytes(s, data)
+    {:ok, resp, _rest} = read(s, <<>>, opts)
+    close(s)
+    resp
+  end
+
+  def send_bytes({:tls, s}, data), do: :ssl.send(s, data)
+  def send_bytes(s, data), do: :gen_tcp.send(s, data)
+
+  def recv({:tls, s}, n, timeout), do: :ssl.recv(s, n, timeout)
+  def recv(s, n, timeout), do: :gen_tcp.recv(s, n, timeout)
+
+  def close({:tls, s}), do: :ssl.close(s)
+  def close(s), do: :gen_tcp.close(s)
 
   # One response from `s`. `buf` is bytes already read. Returns the
   # response and the bytes past it.
@@ -74,7 +102,7 @@ defmodule MuroPlug.TestClient do
     end
   end
 
-  def closed?(s, timeout \\ 1_000), do: :gen_tcp.recv(s, 0, timeout) == {:error, :closed}
+  def closed?(s, timeout \\ 1_000), do: recv(s, 0, timeout) == {:error, :closed}
 
   defp head(s, buf, timeout) do
     case :binary.split(buf, "\r\n\r\n") do
@@ -82,7 +110,7 @@ defmodule MuroPlug.TestClient do
         {:ok, head, rest}
 
       [_] ->
-        case :gen_tcp.recv(s, 0, timeout) do
+        case recv(s, 0, timeout) do
           {:ok, more} -> head(s, buf <> more, timeout)
           {:error, reason} -> {:error, reason, buf}
         end
@@ -95,7 +123,7 @@ defmodule MuroPlug.TestClient do
   end
 
   defp exactly(s, buf, n, timeout) do
-    {:ok, more} = :gen_tcp.recv(s, 0, timeout)
+    {:ok, more} = recv(s, 0, timeout)
     exactly(s, buf <> more, n, timeout)
   end
 
@@ -113,15 +141,82 @@ defmodule MuroPlug.TestClient do
         end
 
       [_] ->
-        {:ok, more} = :gen_tcp.recv(s, 0, timeout)
+        {:ok, more} = recv(s, 0, timeout)
         chunks(s, buf <> more, acc, timeout)
     end
   end
 
   defp until_close(s, buf, timeout) do
-    case :gen_tcp.recv(s, 0, timeout) do
+    case recv(s, 0, timeout) do
       {:ok, more} -> until_close(s, buf <> more, timeout)
       {:error, :closed} -> buf
     end
   end
 end
+
+defmodule MuroPlug.TestCert do
+  @moduledoc false
+  # A test CA and a localhost / 127.0.0.1 certificate it signs, made
+  # once per test run with `openssl` in a temp dir that is removed after
+  # the suite. No key is committed. (`:ssl` refuses a self-signed leaf
+  # as its own trust anchor, so the leaf is signed by a separate CA.)
+
+  def setup! do
+    dir = Path.join(System.tmp_dir!(), "muro_plug_tls_#{System.unique_integer([:positive])}")
+    File.mkdir_p!(dir)
+    ExUnit.after_suite(fn _ -> File.rm_rf!(dir) end)
+    f = &Path.join(dir, &1)
+
+    openssl!(
+      ~w(req -x509 -newkey rsa:2048 -nodes -days 2 -subj /CN=muro_plug-test-ca) ++
+        ["-keyout", f.("ca_key.pem"), "-out", f.("ca.pem")]
+    )
+
+    openssl!(
+      ~w(req -newkey rsa:2048 -nodes -subj /CN=localhost) ++
+        ["-keyout", f.("key.pem"), "-out", f.("req.pem")]
+    )
+
+    File.write!(f.("ext.cnf"), "subjectAltName=DNS:localhost,IP:127.0.0.1\n")
+
+    openssl!(
+      ~w(x509 -req -days 2 -CAcreateserial) ++
+        ["-in", f.("req.pem"), "-CA", f.("ca.pem"), "-CAkey", f.("ca_key.pem")] ++
+        ["-extfile", f.("ext.cnf"), "-out", f.("cert.pem")]
+    )
+
+    :persistent_term.put(__MODULE__, %{
+      dir: dir,
+      cacertfile: f.("ca.pem"),
+      keyfile: f.("key.pem"),
+      certfile: f.("cert.pem")
+    })
+  end
+
+  defp openssl!(args) do
+    {out, status} = System.cmd("openssl", args, stderr_to_stdout: true)
+    if status != 0, do: raise("openssl #{Enum.join(args, " ")} failed:\n#{out}")
+  end
+
+  def dir, do: :persistent_term.get(__MODULE__).dir
+  def cacertfile, do: :persistent_term.get(__MODULE__).cacertfile
+  def keyfile, do: :persistent_term.get(__MODULE__).keyfile
+  def certfile, do: :persistent_term.get(__MODULE__).certfile
+
+  # The server's files, as MuroPlug options.
+  def server_options, do: [scheme: :https, certfile: certfile(), keyfile: keyfile()]
+
+  # The same certificate and key as DER terms (`:cert` / `:key`).
+  def der do
+    [{:Certificate, cert, _}] = :public_key.pem_decode(File.read!(certfile()))
+    [{type, key, _}] = :public_key.pem_decode(File.read!(keyfile()))
+    %{cert: cert, key: {type, key}}
+  end
+
+  # A client that verifies the server against the test CA.
+  def client_options,
+    do: [verify: :verify_peer, cacertfile: String.to_charlist(cacertfile())]
+end
+
+{:ok, _} = Application.ensure_all_started(:ssl)
+MuroPlug.TestCert.setup!()

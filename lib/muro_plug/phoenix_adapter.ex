@@ -5,32 +5,47 @@ defmodule MuroPlug.PhoenixAdapter do
 
       config :my_app, MyAppWeb.Endpoint,
         adapter: MuroPlug.PhoenixAdapter,
-        http: [ip: {127, 0, 0, 1}, port: 4000]
+        http: [ip: {127, 0, 0, 1}, port: 4000],
+        https: [
+          ip: {127, 0, 0, 1},
+          port: 4040,
+          certfile: "priv/cert/selfsigned.pem",
+          keyfile: "priv/cert/selfsigned_key.pem"
+        ]
 
-  The `:http` keyword list is passed to `MuroPlug.child_spec/1`
-  (`:port`, `:ip`, `:max_body`, `:idle_timeout`,
-  `:thousand_island_options`). `:https` is not served yet, and
+  The `:http` and `:https` keyword lists are each passed to
+  `MuroPlug.child_spec/1` (`:port`, `:ip`, `:max_body`,
+  `:idle_timeout`, `:thousand_island_options`, and for `:https` the TLS
+  options listed there). Either or both may be set: each one is its
+  own MuroPlug server under the endpoint's supervisor, with child id
+  `{endpoint, scheme}`. Relative TLS file paths in `:https` resolve
+  against the endpoint's `:otp_app`, as in Plug.Cowboy and Bandit.
+
   WebSockets (LiveView, channels) are a later milestone: `upgrade/3`
   answers `{:error, :not_supported}`.
   """
 
   @doc false
   def child_specs(endpoint, config) do
-    if config[:https],
-      do: raise(ArgumentError, "MuroPlug.PhoenixAdapter does not serve :https yet")
-
     plug = resolve_plug(config[:code_reloader], endpoint)
 
-    for scheme <- [:http], opts = config[scheme] do
+    for scheme <- [:http, :https], opts = config[scheme] do
       opts
-      |> Keyword.drop([:otp_app, :plug, :id])
-      |> Keyword.merge(plug: plug, id: {endpoint, scheme})
+      |> Keyword.drop([:plug, :id, :scheme])
+      |> otp_app(scheme, config[:otp_app])
+      |> Keyword.merge(plug: plug, id: {endpoint, scheme}, scheme: scheme)
       |> MuroPlug.child_spec()
     end
   end
 
+  defp otp_app(opts, :https, otp_app) when otp_app != nil,
+    do: Keyword.put_new(opts, :otp_app, otp_app)
+
+  defp otp_app(opts, :https, nil), do: opts
+  defp otp_app(opts, :http, _), do: Keyword.delete(opts, :otp_app)
+
   @doc "The MuroPlug (Thousand Island) process serving `scheme` for `endpoint`."
-  @spec server_pid(module(), atom()) :: {:ok, pid()} | {:error, :no_server_found}
+  @spec server_pid(module(), :http | :https) :: {:ok, pid()} | {:error, :no_server_found}
   def server_pid(endpoint, scheme \\ :http) do
     endpoint
     |> Supervisor.which_children()

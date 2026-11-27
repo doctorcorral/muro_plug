@@ -12,8 +12,9 @@ The package will live under `doctorcorral` until launch, then move to
 
 ## Status
 
-HTTP/1.1 over TCP. Not published to Hex. WebSockets (LiveView) and TLS
-are later. No HTTP/2.
+HTTP/1.1 over TCP and over TLS (HTTPS). Not published to Hex.
+WebSockets (LiveView) are later. No HTTP/2: over TLS, ALPN advertises
+`http/1.1` only.
 
 ## Usage
 
@@ -23,18 +24,65 @@ children = [
 ]
 ```
 
-Phoenix:
+HTTPS:
+
+```elixir
+children = [
+  {MuroPlug,
+   plug: MyApp.Router,
+   scheme: :https,
+   port: 4040,
+   certfile: "/etc/my_app/cert.pem",
+   keyfile: "/etc/my_app/key.pem"}
+]
+```
+
+Phoenix, with `http:`, `https:`, or both (each is its own server under
+the endpoint, child id `{endpoint, scheme}`, and
+`Endpoint.server_info/1` answers for either scheme):
 
 ```elixir
 config :my_app, MyAppWeb.Endpoint,
   adapter: MuroPlug.PhoenixAdapter,
-  http: [ip: {127, 0, 0, 1}, port: 4000]
+  http: [ip: {127, 0, 0, 1}, port: 4000],
+  https: [
+    ip: {127, 0, 0, 1},
+    port: 4040,
+    certfile: "priv/cert/selfsigned.pem",
+    keyfile: "priv/cert/selfsigned_key.pem"
+  ]
 ```
 
-Options (`MuroPlug.child_spec/1`, and the endpoint's `:http` list):
-`:plug`, `:port`, `:ip`, `:max_body` (the book's `max`, default
-8_000_000), `:idle_timeout` (default 60_000 ms), and
-`:thousand_island_options`.
+Options (`MuroPlug.child_spec/1`, and the endpoint's `:http` and
+`:https` lists): `:plug`, `:scheme` (`:http` default, or `:https`),
+`:port` (default 4000 for `:http`, 4040 for `:https`), `:ip`,
+`:max_body` (the book's `max`, default 8_000_000), `:idle_timeout`
+(default 60_000 ms), and `:thousand_island_options`.
+
+With `scheme: :https` the server runs on
+`ThousandIsland.Transports.SSL`, and these TLS options go through
+`Plug.SSL.configure/1` (the checks Plug.Cowboy and Bandit run) to
+`:ssl`: `:keyfile`, `:certfile`, `:cacertfile`, `:dhfile`, `:key`,
+`:cert`, `:cacerts`, `:certs_keys`, `:sni_hosts`, `:sni_fun`,
+`:password`, `:otp_app` (relative paths resolve against its app dir; a
+Phoenix endpoint passes its own), `:cipher_suite` (`:strong` or
+`:compatible`), `:ciphers`, `:versions`, `:eccs`, `:verify`,
+`:fail_if_no_peer_cert`, and `:alpn_preferred_protocols` (only
+`["http/1.1"]`, the default). TLS options inside
+`thousand_island_options: [transport_options: ...]` are used too, and
+top-level ones override them. `:ssl` is started before the listener. A
+bad `:scheme`, a missing key or certificate, a missing file, other
+ALPN protocols, or TLS options with `scheme: :http` (top-level or in
+`:transport_options`) raise `ArgumentError`.
+
+The handler and adapter are the same on both transports: Thousand
+Island finishes the handshake, and every read and write is
+`ThousandIsland.Socket`. `conn.scheme` is `:https`, `get_ssl_data/1`
+is the `:ssl` connection information, and `get_peer_data/1` carries a
+client certificate (DER) when one was sent. `send_file` over TLS is
+Thousand Island's SSL `sendfile/4`: `:file.pread` of at most 1 MiB at
+a time, written with `:ssl.send` (TCP uses the kernel's
+`:file.sendfile`).
 
 ## How it fits together
 
@@ -101,6 +149,19 @@ chunked and close-delimited responses, `send_file`, HEAD, 204,
 `Connection: close`, HTTP/1.0, `inform/3`, a raising plug), a
 `Plug.Router` app through `:httpc`, and a `Phoenix.Endpoint` with a
 router and controller on `MuroPlug.PhoenixAdapter`.
+
+`test/tls_test.exs` runs the same paths over real TLS sockets: a test
+CA and a localhost certificate are made with `openssl` in a temp dir
+when the suite starts and removed after it (no key is committed).
+It covers `conn.scheme == :https`, TLS and peer data, ALPN,
+Content-Length, chunked and streamed bodies, keep-alive, pipelining,
+`100 Continue`, the book's 400/413/414/417/431/501, `send_file` (with a
+2.5 MiB file past the SSL transport's 1 MiB chunk, an offset, past
+EOF, HEAD, and a closed socket), `send_chunked`, `inform/3`, client
+certificates, DER `:cert`/`:key`, option errors, a `Plug.Router` app
+through `:httpc` over HTTPS, and Phoenix endpoints with `https:` alone
+and `http:` + `https:` together, with `server_info/2` for each.
+`openssl` must be on the `PATH` for `mix test`.
 
 ## Performance
 

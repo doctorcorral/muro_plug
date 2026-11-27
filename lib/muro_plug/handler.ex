@@ -16,6 +16,11 @@ defmodule MuroPlug.Handler do
 
   The receive buffer is one binary. Request views, framing ends and
   header-block ends all come from the book.
+
+  The handler is the same over TCP and TLS: Thousand Island finishes
+  the TLS handshake before `handle_connection/2`, and every read and
+  write goes through `ThousandIsland.Socket`. The scheme (`"http"` or
+  `"https"`) comes from `MuroPlug`'s options.
   """
 
   use ThousandIsland.Handler
@@ -310,8 +315,17 @@ defmodule MuroPlug.Handler do
 
   defp peer_data(socket) do
     case Socket.peername(socket) do
-      {:ok, {address, port}} -> %{address: address, port: port, ssl_cert: nil}
-      _ -> %{address: {0, 0, 0, 0}, port: 0, ssl_cert: nil}
+      {:ok, {address, port}} -> %{address: address, port: port, ssl_cert: peer_cert(socket)}
+      _ -> %{address: {0, 0, 0, 0}, port: 0, ssl_cert: peer_cert(socket)}
+    end
+  end
+
+  # The client's DER certificate over TLS, when it sent one.
+  defp peer_cert(socket) do
+    with true <- Socket.secure?(socket), {:ok, cert} <- Socket.peercert(socket) do
+      cert
+    else
+      _ -> nil
     end
   end
 

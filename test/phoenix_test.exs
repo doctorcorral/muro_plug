@@ -86,8 +86,8 @@ defmodule MuroPlug.PhoenixTest do
     assert MuroPlug.TestClient.closed?(s)
   end
 
-  test ":https is refused with a clear error" do
-    assert_raise ArgumentError, ~r/https/, fn ->
+  test ":https without a key or certificate is refused with a clear error" do
+    assert_raise ArgumentError, ~r/missing option :key/, fn ->
       MuroPlug.PhoenixAdapter.child_specs(Endpoint, https: [port: 0], otp_app: :muro_plug)
     end
   end
