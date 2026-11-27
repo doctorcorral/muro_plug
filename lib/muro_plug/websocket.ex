@@ -46,11 +46,16 @@ defmodule MuroPlug.WebSocket do
     * `:compress` — negotiate RFC 7692 `permessage-deflate` when the
       client offers it. `false` (the default) never advertises
       `Sec-WebSocket-Extensions`. `true`, or a keyword list of
-      `:zlib` deflate options (`:level`, `:mem_level`, `:strategy`),
-      accepts a valid offer and compresses outgoing data frames
-      (RSV1). Control frames are never compressed. `:deflate_options`
-      (or `:deflate_opts`) is the same keyword list when `:compress`
-      is `true`. Frames with RSV1 set without a negotiated extension,
+      `:zlib` deflate options (`:level`, `:mem_level`, `:strategy`,
+      and `:window_bits` 9..15), accepts a valid offer and compresses
+      outgoing data frames (RSV1). Control frames are never compressed.
+      `:deflate_options` (or `:deflate_opts`) is the same keyword list
+      when `:compress` is `true`. `:window_bits` caps the server's
+      deflate window and is advertised as `server_max_window_bits`
+      when it is below 15 or below the client's offer (`client_max_window_bits`
+      may still be 8..15; `server_max_window_bits=8` is skipped
+      because `:zlib` cannot deflate with a raw window of 8).
+      Frames with RSV1 set without a negotiated extension,
       or RSV1 on a continuation or control frame, close with 1002.
       A corrupt deflate payload or invalid UTF-8 after inflate closes
       with 1007; inflated bytes past `:max_message_size` close with

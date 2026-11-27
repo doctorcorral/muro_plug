@@ -25,7 +25,7 @@ defmodule MuroPlug.WebSocket.PerMessageDeflate do
   @type params :: %{
           required(:server_no_context_takeover) => boolean(),
           required(:client_no_context_takeover) => boolean(),
-          required(:server_max_window_bits) => 8..15,
+          required(:server_max_window_bits) => 9..15,
           required(:client_max_window_bits) => 8..15,
           required(:advertised) => keyword()
         }
@@ -39,10 +39,12 @@ defmodule MuroPlug.WebSocket.PerMessageDeflate do
   @spec negotiate([{binary(), binary()}], keyword()) :: :none | {:ok, params()}
   def negotiate(headers, opts) when is_list(headers) and is_list(opts) do
     if enabled?(opts) do
+      cap = window_bits(opts)
+
       headers
       |> offers()
       |> Enum.find_value(:none, fn offer ->
-        case accept(offer) do
+        case accept(offer, cap) do
           nil -> false
           params -> {:ok, params}
         end
@@ -101,8 +103,18 @@ defmodule MuroPlug.WebSocket.PerMessageDeflate do
   @spec inflate(binary(), t(), non_neg_integer() | :infinity) ::
           {:ok, binary(), t()} | {:error, :message_too_big | :bad_deflate}
   def inflate(data, %__MODULE__{} = ctx, max) do
-    input = data <> @tail
+    # A payload that already ends in the sync-flush trailer is
+    # non-compliant (RFC 7692 §7.2.1 removes those four octets).
+    # Appending @tail would leave an incomplete stored block in the
+    # inflate stream and poison the next message under context takeover.
+    if suffix?(data, @tail) do
+      {:error, :bad_deflate}
+    else
+      inflate_ok(data <> @tail, ctx, max)
+    end
+  end
 
+  defp inflate_ok(input, ctx, max) do
     case take(ctx.inflate, :zlib.safeInflate(ctx.inflate, input), [], 0, max) do
       {:ok, iodata} ->
         if ctx.client_no_context_takeover, do: :ok = :zlib.inflateReset(ctx.inflate)
@@ -114,6 +126,11 @@ defmodule MuroPlug.WebSocket.PerMessageDeflate do
   rescue
     _ -> {:error, :bad_deflate}
   end
+
+  defp suffix?(data, suffix) when byte_size(data) >= byte_size(suffix),
+    do: binary_part(data, byte_size(data) - byte_size(suffix), byte_size(suffix)) == suffix
+
+  defp suffix?(_data, _suffix), do: false
 
   defp take(z, {:continue, chunk}, acc, size, max) do
     size = size + IO.iodata_length(chunk)
@@ -176,7 +193,10 @@ defmodule MuroPlug.WebSocket.PerMessageDeflate do
   end
 
   @doc false
-  # :zlib's raw deflate does not accept window_bits = 8; 9 is the floor.
+  # :zlib's raw inflate does not accept window_bits = 8; 9 is the floor.
+  # Client inflate may still use 8 (a larger window is a superset). Server
+  # deflate windows are 9..15 so the advertised server_max_window_bits
+  # is never smaller than the window actually used.
   @spec window(-15..-8) :: -15..-9
   def window(-8), do: -9
   def window(bits), do: bits
@@ -197,7 +217,7 @@ defmodule MuroPlug.WebSocket.PerMessageDeflate do
   def deflate_opts(opts) do
     case Keyword.get(opts, :deflate_options) || Keyword.get(opts, :deflate_opts) ||
            Keyword.get(opts, :compress) do
-      list when is_list(list) -> Keyword.take(list, [:level, :mem_level, :strategy])
+      list when is_list(list) -> Keyword.take(list, [:level, :mem_level, :strategy, :window_bits])
       _ -> []
     end
   end
@@ -210,10 +230,18 @@ defmodule MuroPlug.WebSocket.PerMessageDeflate do
 
   def valid_deflate_opts?(_), do: false
 
+  # Server deflate window cap from :deflate_options / :compress. nil means 15.
+  defp window_bits(opts) do
+    case Keyword.get(deflate_opts(opts), :window_bits) do
+      n when n in 9..15 -> n
+      _ -> nil
+    end
+  end
+
   defp valid_deflate_opt?({:level, v}), do: v in @valid_levels
   defp valid_deflate_opt?({:mem_level, v}), do: is_integer(v) and v in 1..9
   defp valid_deflate_opt?({:strategy, v}), do: v in @valid_strategies
-  defp valid_deflate_opt?({:window_bits, _}), do: true
+  defp valid_deflate_opt?({:window_bits, v}), do: is_integer(v) and v in 9..15
   defp valid_deflate_opt?(_), do: false
 
   ## Negotiation
@@ -293,16 +321,16 @@ defmodule MuroPlug.WebSocket.PerMessageDeflate do
 
   defp unquote_value(value), do: value
 
-  defp accept({@extension, params}) do
+  defp accept({@extension, params}, cap) do
     with true <- unique_keys?(params),
          {:ok, taken} <- take_params(params) do
-      build(taken)
+      build(taken, cap)
     else
       _ -> nil
     end
   end
 
-  defp accept(_other), do: nil
+  defp accept(_other, _cap), do: nil
 
   defp unique_keys?(params), do: params |> Enum.map(&elem(&1, 0)) |> then(&(&1 == Enum.uniq(&1)))
 
@@ -322,7 +350,7 @@ defmodule MuroPlug.WebSocket.PerMessageDeflate do
   defp collect([{"server_max_window_bits", true} | _], _acc), do: :error
 
   defp collect([{"server_max_window_bits", value} | rest], acc) do
-    case bits(value) do
+    case server_bits(value) do
       nil -> :error
       n -> collect(rest, Map.put(acc, :server_max_window_bits, n))
     end
@@ -351,7 +379,16 @@ defmodule MuroPlug.WebSocket.PerMessageDeflate do
 
   defp collect([_bad | _], _acc), do: :error
 
-  # 8..15, no leading zeroes (RFC 7692 §7.1.2).
+  # 8..15, no leading zeroes (RFC 7692 §7.1.2). server_max_window_bits
+  # cannot be 8: :zlib remaps a raw window of 8 to 9, and advertising 8
+  # would let a peer inflate with a smaller window than we deflate with.
+  defp server_bits(value) do
+    case bits(value) do
+      n when n in 9..15 -> n
+      _ -> nil
+    end
+  end
+
   defp bits(n) when is_integer(n) and n in 8..15, do: n
 
   defp bits(value) when is_binary(value) do
@@ -362,27 +399,35 @@ defmodule MuroPlug.WebSocket.PerMessageDeflate do
 
   defp bits(_), do: nil
 
-  defp build(taken) do
+  defp build(taken, cap) do
     server_nct? = Map.get(taken, :server_no_context_takeover, false)
     client_nct? = Map.get(taken, :client_no_context_takeover, false)
-    server_bits = Map.get(taken, :server_max_window_bits)
+    offered = Map.get(taken, :server_max_window_bits)
+    {server_bits, advertise_server?} = clamp_server_bits(offered, cap)
     client_bits = Map.get(taken, :client_max_window_bits, 15)
 
     advertised =
       []
       |> put_flag(:server_no_context_takeover, server_nct?)
       |> put_flag(:client_no_context_takeover, client_nct?)
-      |> put_bits(:server_max_window_bits, server_bits)
+      |> put_bits(:server_max_window_bits, if(advertise_server?, do: server_bits))
       |> put_client_bits(Map.get(taken, :client_bits_offered, false), client_bits)
 
     %{
       server_no_context_takeover: server_nct?,
       client_no_context_takeover: client_nct?,
-      server_max_window_bits: server_bits || 15,
+      server_max_window_bits: server_bits,
       client_max_window_bits: client_bits,
       advertised: advertised
     }
   end
+
+  # :window_bits caps the server deflate window (9..15). Advertise the
+  # chosen value when the client offered a cap or we chose below 15.
+  defp clamp_server_bits(nil, nil), do: {15, false}
+  defp clamp_server_bits(nil, cap), do: {cap, cap < 15}
+  defp clamp_server_bits(offered, nil), do: {offered, true}
+  defp clamp_server_bits(offered, cap), do: {min(offered, cap), true}
 
   defp put_flag(acc, _k, false), do: acc
   defp put_flag(acc, k, true), do: acc ++ [{k, true}]

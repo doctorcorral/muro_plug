@@ -129,6 +129,13 @@ defmodule MuroPlug.WebSocketTest do
           max_message_size: 2_000
         )
 
+    defp route(["deflate_win"], conn, opts),
+      do:
+        WebSockAdapter.upgrade(conn, Echo, %{test: opts.test},
+          compress: true,
+          deflate_options: [window_bits: 10]
+        )
+
     defp route(["read_body"], conn, opts) do
       {:ok, _body, conn} = Plug.Conn.read_body(conn)
       WebSockAdapter.upgrade(conn, Echo, %{test: opts.test}, [])
@@ -434,7 +441,7 @@ defmodule MuroPlug.WebSocketTest do
   describe "protocol errors" do
     for {name, bytes, code} <- [
           {"an unmasked client frame", quote(do: frame(:text, "x", mask: false)), 1002},
-          {"a reserved RSV bit", quote(do: frame(:text, "x", rsv: 4)), 1002},
+          {"RSV1 set without a negotiated extension", quote(do: frame(:text, "x", rsv: 4)), 1002},
           {"a reserved data opcode", quote(do: frame(3, "x")), 1002},
           {"a reserved control opcode", quote(do: frame(0xB, "x")), 1002},
           {"a fragmented ping", quote(do: frame(:ping, "x", fin: false)), 1002},
@@ -740,6 +747,64 @@ defmodule MuroPlug.WebSocketTest do
       assert ext(resp) == "permessage-deflate; client_max_window_bits=15"
     end
 
+    test "server_max_window_bits=8 is skipped in favour of a later valid offer", ctx do
+      %{s: s, resp: resp} =
+        deflate_up(ctx, "/deflate",
+          headers: [
+            {"Sec-WebSocket-Extensions",
+             "permessage-deflate; server_max_window_bits=8, permessage-deflate; client_no_context_takeover"}
+          ]
+        )
+
+      assert ext(resp) == "permessage-deflate; client_no_context_takeover"
+      z_in = inflate_stream()
+      z_out = deflate_stream()
+      :ok = send_compressed(s, :text, "ok", z_out, reset: true)
+      assert {:text, "ok", _} = next_inflated(s, z_in, <<>>, reset: true)
+      close_z(z_in)
+      close_z(z_out)
+    end
+
+    test "a lone server_max_window_bits=8 offer proceeds uncompressed", ctx do
+      %{s: s, resp: resp} =
+        deflate_up(ctx, "/deflate",
+          headers: [{"Sec-WebSocket-Extensions", "permessage-deflate; server_max_window_bits=8"}]
+        )
+
+      refute ext(resp)
+      :ok = send_frame(s, :text, "plain")
+      assert {:text, "plain", _} = next(s)
+    end
+
+    test ":window_bits caps and advertises the server deflate window", ctx do
+      %{s: s, resp: resp} = deflate_up(ctx, "/deflate_win")
+      assert ext(resp) == "permessage-deflate; server_max_window_bits=10"
+      z_in = inflate_stream(10)
+      z_out = deflate_stream()
+      :ok = send_compressed(s, :text, "capped", z_out)
+      assert {:text, "capped", _} = next_inflated(s, z_in)
+      close_z(z_in)
+      close_z(z_out)
+
+      %{resp: resp} =
+        deflate_up(ctx, "/deflate_win",
+          headers: [
+            {"Sec-WebSocket-Extensions", "permessage-deflate; server_max_window_bits=12"}
+          ]
+        )
+
+      assert ext(resp) == "permessage-deflate; server_max_window_bits=10"
+
+      %{resp: resp} =
+        deflate_up(ctx, "/deflate_win",
+          headers: [
+            {"Sec-WebSocket-Extensions", "permessage-deflate; server_max_window_bits=9"}
+          ]
+        )
+
+      assert ext(resp) == "permessage-deflate; server_max_window_bits=9"
+    end
+
     test "the first invalid offer is skipped in favour of a later valid one", ctx do
       %{s: s, resp: resp} =
         deflate_up(ctx, "/deflate",
@@ -867,6 +932,17 @@ defmodule MuroPlug.WebSocketTest do
       :ok = send_frame(s, :text, :crypto.strong_rand_bytes(32), rsv: 4)
       assert {1007, ""} = close_frame(s)
       assert_receive {:terminate, {:error, :bad_deflate}}
+    end
+
+    test "an unstripped deflate trailer closes with 1007", ctx do
+      %{s: s} = deflate_up(ctx)
+      z_out = deflate_stream()
+      raw = z_out |> :zlib.deflate("hello", :sync) |> IO.iodata_to_binary()
+      assert binary_part(raw, byte_size(raw) - 4, 4) == <<0x00, 0x00, 0xFF, 0xFF>>
+      :ok = send_frame(s, :text, raw, rsv: 4)
+      assert {1007, ""} = close_frame(s)
+      assert_receive {:terminate, {:error, :bad_deflate}}
+      close_z(z_out)
     end
 
     test "invalid UTF-8 after inflate closes with 1007", ctx do
@@ -1037,7 +1113,12 @@ defmodule MuroPlug.WebSocketFrameTest do
              close_timeout: 0,
              validate_utf8: false,
              compress: true,
-             deflate_options: [level: :best_speed, mem_level: 8, strategy: :default],
+             deflate_options: [
+               level: :best_speed,
+               mem_level: 8,
+               strategy: :default,
+               window_bits: 12
+             ],
              fullsweep_after: nil,
              max_heap_size: %{
                size: 1_000_000,
@@ -1048,7 +1129,7 @@ defmodule MuroPlug.WebSocketFrameTest do
              connect_info: [:peer_data]
            ) == :ok
 
-    assert Connection.validate_opts!(compress: [level: 6, mem_level: 1]) == :ok
+    assert Connection.validate_opts!(compress: [level: 6, mem_level: 1, window_bits: 9]) == :ok
     assert Connection.validate_opts!(max_heap_size: 0) == :ok
 
     for bad <- [
@@ -1062,6 +1143,9 @@ defmodule MuroPlug.WebSocketFrameTest do
           validate_utf8: 1,
           compress: nil,
           compress: :yes,
+          compress: [window_bits: 8],
+          deflate_options: [window_bits: 16],
+          deflate_opts: [window_bits: 0],
           fullsweep_after: -1,
           max_heap_size: :lots,
           max_heap_size: %{size: -1},

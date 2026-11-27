@@ -160,9 +160,14 @@ dependency already) is what applications call.
   ms), `:fullsweep_after`, `:max_heap_size` (an integer or a map with
   `:size` and optional `:kill`, `:error_logger`,
   `:include_shared_binaries`). `:compress` (`false` by default; `true`
-  or a keyword list of `:zlib` options) negotiates RFC 7692
+  or a keyword list of `:zlib` options: `:level`, `:mem_level`,
+  `:strategy`, and `:window_bits` 9..15) negotiates RFC 7692
   `permessage-deflate` when the client offers it, compresses outgoing
-  data frames, and inflates incoming RSV1 data messages. A known option
+  data frames, and inflates incoming RSV1 data messages.
+  `:deflate_options` (or `:deflate_opts`) is the same keyword list when
+  `:compress` is `true`. `:window_bits` caps the server deflate window
+  and is advertised as `server_max_window_bits` when it is below 15 or
+  below the client's offer. A known option
   with a bad value (e.g. `close_timeout: :infinity` or
   `max_heap_size: %{size: -1}`) raises
   `ArgumentError` from the upgrade, before the 101; unknown keys (Phoenix

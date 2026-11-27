@@ -83,6 +83,7 @@ defmodule MuroPlug.PerMessageDeflateTest do
           "permessage-deflate; server_max_window_bits",
           "permessage-deflate; server_max_window_bits=99",
           "permessage-deflate; server_max_window_bits=08",
+          "permessage-deflate; server_max_window_bits=8",
           "permessage-deflate; client_max_window_bits=7",
           "permessage-deflate; client_no_context_takeover=true",
           "permessage-deflate; client_no_context_takeover; client_no_context_takeover",
@@ -127,6 +128,87 @@ defmodule MuroPlug.PerMessageDeflateTest do
     {:ok, params} = PMD.negotiate(headers("permessage-deflate"), compress: true)
     ctx = PMD.open(params)
     assert {:error, :bad_deflate} = PMD.inflate(<<1, 2, 3, 4, 5>>, ctx, 1_000)
+    PMD.close(ctx)
+  end
+
+  test "server_max_window_bits=8 is skipped; a later valid offer or none remains" do
+    assert {:ok, params} =
+             PMD.negotiate(
+               headers(
+                 "permessage-deflate; server_max_window_bits=8, permessage-deflate; client_no_context_takeover"
+               ),
+               compress: true
+             )
+
+    assert params.client_no_context_takeover
+    refute params.server_max_window_bits == 8
+
+    assert PMD.negotiate(
+             headers("permessage-deflate; server_max_window_bits=8"),
+             compress: true
+           ) == :none
+
+    assert {:ok, params} =
+             PMD.negotiate(headers("permessage-deflate; client_max_window_bits=8"),
+               compress: true
+             )
+
+    assert params.client_max_window_bits == 8
+  end
+
+  test ":window_bits caps the advertised server deflate window" do
+    assert {:ok, params} =
+             PMD.negotiate(headers("permessage-deflate"),
+               compress: true,
+               deflate_options: [window_bits: 10]
+             )
+
+    assert params.server_max_window_bits == 10
+    assert PMD.header(params) == "permessage-deflate; server_max_window_bits=10"
+
+    assert {:ok, params} =
+             PMD.negotiate(headers("permessage-deflate; server_max_window_bits=12"),
+               compress: [window_bits: 10]
+             )
+
+    assert params.server_max_window_bits == 10
+    assert PMD.header(params) == "permessage-deflate; server_max_window_bits=10"
+
+    assert {:ok, params} =
+             PMD.negotiate(headers("permessage-deflate; server_max_window_bits=9"),
+               compress: true,
+               deflate_options: [window_bits: 12]
+             )
+
+    assert params.server_max_window_bits == 9
+    assert PMD.header(params) == "permessage-deflate; server_max_window_bits=9"
+
+    assert {:ok, params} =
+             PMD.negotiate(headers("permessage-deflate"),
+               compress: true,
+               deflate_options: [window_bits: 15]
+             )
+
+    assert params.server_max_window_bits == 15
+    assert PMD.header(params) == "permessage-deflate"
+  end
+
+  test "a payload that already ends with the deflate trailer is rejected" do
+    {:ok, params} = PMD.negotiate(headers("permessage-deflate"), compress: true)
+    ctx = PMD.open(params)
+    z = :zlib.open()
+    :ok = :zlib.deflateInit(z, :default, :deflated, -15, 8, :default)
+    raw = z |> :zlib.deflate("hello", :sync) |> IO.iodata_to_binary()
+    :zlib.close(z)
+    assert binary_part(raw, byte_size(raw) - 4, 4) == <<0x00, 0x00, 0xFF, 0xFF>>
+
+    assert {:error, :bad_deflate} = PMD.inflate(raw, ctx, 1_000)
+
+    # The same context is still usable: a well-formed (stripped) message
+    # after the rejected one must not be poisoned.
+    stripped = binary_part(raw, 0, byte_size(raw) - 4)
+    assert {:ok, "hello", ctx} = PMD.inflate(stripped, ctx, 1_000)
+    assert {:ok, "hello", _} = PMD.inflate(stripped, ctx, 1_000)
     PMD.close(ctx)
   end
 
