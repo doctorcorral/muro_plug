@@ -11,6 +11,12 @@ defmodule MuroPlug.Adapter do
 
   Request and response bodies are binaries or iodata of binaries. A
   body is never a list of octets.
+
+  Over TLS the same calls go through `ThousandIsland.Transports.SSL`.
+  `send_file/6` uses `ThousandIsland.Socket.sendfile/4`, which is the
+  kernel's `:file.sendfile` on TCP and, on SSL, `:file.pread` of up to
+  1 MiB at a time written with `:ssl.send`, so a file body is the same
+  bytes on either transport.
   """
 
   @behaviour Plug.Conn.Adapter
@@ -237,7 +243,14 @@ defmodule MuroPlug.Adapter do
   def get_sock_data(%__MODULE__{sock: sock}), do: sock
 
   @impl true
-  def get_ssl_data(%__MODULE__{}), do: nil
+  def get_ssl_data(%__MODULE__{socket: socket}) do
+    with true <- Socket.secure?(socket),
+         {:ok, info} <- Socket.connection_information(socket) do
+      info
+    else
+      _ -> nil
+    end
+  end
 
   @impl true
   def get_http_protocol(%__MODULE__{http11: true}), do: :"HTTP/1.1"
