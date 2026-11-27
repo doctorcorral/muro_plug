@@ -10,11 +10,12 @@ defmodule MuroPlug.WebSocket.Connection do
   #                      close or `close_timeout`, then drop the socket
   #   {:close, conn}     drop the socket now
   #
-  # `terminate/2` runs at most once.
+  # `terminate/2` runs at most once. :zlib streams opened for
+  # permessage-deflate are closed there too.
 
   require Logger
 
-  alias MuroPlug.WebSocket.Frame
+  alias MuroPlug.WebSocket.{Frame, PerMessageDeflate}
   alias ThousandIsland.Socket
 
   defstruct [
@@ -24,6 +25,7 @@ defmodule MuroPlug.WebSocket.Connection do
     :max_message,
     :timeout,
     :close_timeout,
+    :compress,
     utf8: true,
     control?: false,
     terminate?: false,
@@ -54,8 +56,16 @@ defmodule MuroPlug.WebSocket.Connection do
         unless is_integer(value) and value >= 0,
           do: bad_opt!(:close_timeout, value, "a non-negative integer (milliseconds)")
 
-      {key, value} when key in [:validate_utf8, :compress] ->
-        unless is_boolean(value), do: bad_opt!(key, value, "a boolean")
+      {:validate_utf8, value} ->
+        unless is_boolean(value), do: bad_opt!(:validate_utf8, value, "a boolean")
+
+      {:compress, value} ->
+        unless is_boolean(value) or PerMessageDeflate.valid_deflate_opts?(value),
+          do: bad_opt!(:compress, value, "a boolean or a keyword list of deflate options")
+
+      {key, value} when key in [:deflate_options, :deflate_opts] ->
+        unless value == [] or PerMessageDeflate.valid_deflate_opts?(value),
+          do: bad_opt!(key, value, "a keyword list of deflate options")
 
       {key, nil} when key in [:fullsweep_after, :max_heap_size] ->
         :ok
@@ -65,8 +75,13 @@ defmodule MuroPlug.WebSocket.Connection do
           do: bad_opt!(:fullsweep_after, value, "a non-negative integer")
 
       {:max_heap_size, value} ->
-        unless (is_integer(value) and value >= 0) or is_map(value),
-          do: bad_opt!(:max_heap_size, value, "a non-negative integer or a map")
+        unless valid_max_heap_size?(value),
+          do:
+            bad_opt!(
+              :max_heap_size,
+              value,
+              "a non-negative integer or a map with :size (a non-negative integer) and optional :kill, :error_logger, :include_shared_binaries booleans"
+            )
 
       _other ->
         :ok
@@ -80,14 +95,37 @@ defmodule MuroPlug.WebSocket.Connection do
         "MuroPlug: WebSocket options must be a keyword list, got: #{inspect(opts)}"
       )
 
+  defp valid_max_heap_size?(n) when is_integer(n) and n >= 0, do: true
+
+  defp valid_max_heap_size?(map) when is_map(map) do
+    allowed = [:size, :kill, :error_logger, :include_shared_binaries]
+    Map.has_key?(map, :size) and Map.keys(map) -- allowed == [] and heap_fields?(map)
+  end
+
+  defp valid_max_heap_size?(_), do: false
+
+  defp heap_fields?(map) do
+    heap_ok?(map, :size, &(is_integer(&1) and &1 >= 0)) and
+      heap_ok?(map, :kill, &is_boolean/1) and
+      heap_ok?(map, :error_logger, &is_boolean/1) and
+      heap_ok?(map, :include_shared_binaries, &is_boolean/1)
+  end
+
+  defp heap_ok?(map, key, pred) do
+    case Map.fetch(map, key) do
+      :error -> key != :size
+      {:ok, value} -> pred.(value)
+    end
+  end
+
   defp bad_opt!(key, value, expected) do
     raise ArgumentError,
           "MuroPlug: WebSocket option #{inspect(key)} must be #{expected}, got: #{inspect(value)}"
   end
 
   @doc "The connection for `{handler, state, opts}` before `init/1` runs."
-  @spec new(module(), keyword()) :: t()
-  def new(handler, opts) do
+  @spec new(module(), keyword(), PerMessageDeflate.params() | nil) :: t()
+  def new(handler, opts, compress \\ nil) do
     Code.ensure_loaded(handler)
     max_frame = Keyword.get(opts, :max_frame_size, 10_000_000)
 
@@ -103,7 +141,8 @@ defmodule MuroPlug.WebSocket.Connection do
       close_timeout: Keyword.get(opts, :close_timeout, 5_000),
       utf8: Keyword.get(opts, :validate_utf8, true),
       control?: function_exported?(handler, :handle_control, 2),
-      terminate?: function_exported?(handler, :terminate, 2)
+      terminate?: function_exported?(handler, :terminate, 2),
+      compress: if(compress, do: PerMessageDeflate.open(compress, opts))
     }
   end
 
@@ -172,23 +211,35 @@ defmodule MuroPlug.WebSocket.Connection do
   end
 
   # After the server's close only the client's close matters (§5.5.1).
-  defp frame({_fin, :close, _}, _socket, %__MODULE__{phase: :closing} = conn), do: {:close, conn}
+  defp frame({_fin, :close, _, _}, _socket, %__MODULE__{phase: :closing} = conn),
+    do: {:close, conn}
+
   defp frame(_frame, _socket, %__MODULE__{phase: :closing} = conn), do: {:continue, conn}
 
-  defp frame({_fin, op, _}, socket, %__MODULE__{frag: {_, _, _, _}} = conn)
+  # RSV1 is only legal on the first frame of a data message, and only
+  # when permessage-deflate was negotiated (RFC 7692 §7.2.3).
+  defp frame({_fin, op, _data, true}, socket, conn)
+       when op in [:continuation, :close, :ping, :pong] or is_nil(conn.compress),
+       do: fail(1002, :reserved_bits, socket, conn)
+
+  defp frame({_fin, op, _, _}, socket, %__MODULE__{frag: {_, _, _, _, _}} = conn)
        when op in [:text, :binary],
        do: fail(1002, :data_frame_mid_message, socket, conn)
 
-  defp frame({true, op, data}, socket, conn) when op in [:text, :binary],
-    do: message(op, data, socket, conn)
+  defp frame({true, op, data, rsv1}, socket, conn) when op in [:text, :binary],
+    do: message(op, data, rsv1, socket, conn)
 
-  defp frame({false, op, data}, socket, conn) when op in [:text, :binary],
-    do: fragment(op, data, socket, conn)
+  defp frame({false, op, data, rsv1}, socket, conn) when op in [:text, :binary],
+    do: fragment(op, data, rsv1, socket, conn)
 
-  defp frame({_fin, :continuation, _}, socket, %__MODULE__{frag: nil} = conn),
+  defp frame({_fin, :continuation, _, _}, socket, %__MODULE__{frag: nil} = conn),
     do: fail(1002, :unexpected_continuation, socket, conn)
 
-  defp frame({fin, :continuation, data}, socket, %__MODULE__{frag: {op, chunks, n, size}} = conn) do
+  defp frame(
+         {fin, :continuation, data, _rsv1},
+         socket,
+         %__MODULE__{frag: {op, chunks, n, size, rsv1}} = conn
+       ) do
     size = size + byte_size(data)
 
     cond do
@@ -196,27 +247,27 @@ defmodule MuroPlug.WebSocket.Connection do
         fail(1009, :message_too_big, socket, conn)
 
       fin ->
-        message(op, IO.iodata_to_binary(Enum.reverse([data | chunks])), socket, %{
+        message(op, IO.iodata_to_binary(Enum.reverse([data | chunks])), rsv1, socket, %{
           conn
           | frag: nil
         })
 
       true ->
-        {:continue, %{conn | frag: chunk(op, [data | chunks], n + 1, size)}}
+        {:continue, %{conn | frag: chunk(op, [data | chunks], n + 1, size, rsv1)}}
     end
   end
 
-  defp frame({_fin, :ping, data}, socket, conn) do
+  defp frame({_fin, :ping, data, _}, socket, conn) do
     case Socket.send(socket, Frame.encode(:pong, data)) do
       :ok -> control(:ping, data, socket, conn)
       {:error, reason} -> {:close, terminate(conn, {:error, reason})}
     end
   end
 
-  defp frame({_fin, :pong, data}, socket, conn), do: control(:pong, data, socket, conn)
+  defp frame({_fin, :pong, data, _}, socket, conn), do: control(:pong, data, socket, conn)
 
   # The client's close: echo its code (§5.5.1), then drop the socket.
-  defp frame({_fin, :close, payload}, socket, conn) do
+  defp frame({_fin, :close, payload, _}, socket, conn) do
     case Frame.close_payload(payload, conn.utf8) do
       {:ok, code, _reason} ->
         _ = Socket.send(socket, if(code, do: close_frame(code), else: Frame.encode(:close, <<>>)))
@@ -227,32 +278,62 @@ defmodule MuroPlug.WebSocket.Connection do
     end
   end
 
-  defp fragment(op, data, socket, conn) do
+  defp fragment(op, data, rsv1, socket, conn) do
     if too_big?(byte_size(data), conn.max_message),
       do: fail(1009, :message_too_big, socket, conn),
-      else: {:continue, %{conn | frag: {op, [data], 1, byte_size(data)}}}
+      else: {:continue, %{conn | frag: {op, [data], 1, byte_size(data), rsv1}}}
   end
 
   # A fragmented message is {opcode, chunks newest first, chunk count,
-  # octets}. Every @coalesce chunks fold into one binary, so many tiny
-  # fragments cost binaries, not a cons cell (and a refc binary) each.
-  defp chunk(op, chunks, n, size) when n >= @coalesce,
-    do: {op, [IO.iodata_to_binary(Enum.reverse(chunks))], 1, size}
+  # octets, rsv1}. Every @coalesce chunks fold into one binary, so many
+  # tiny fragments cost binaries, not a cons cell (and a refc binary) each.
+  defp chunk(op, chunks, n, size, rsv1) when n >= @coalesce,
+    do: {op, [IO.iodata_to_binary(Enum.reverse(chunks))], 1, size, rsv1}
 
-  defp chunk(op, chunks, n, size), do: {op, chunks, n, size}
+  defp chunk(op, chunks, n, size, rsv1), do: {op, chunks, n, size, rsv1}
 
-  defp message(op, data, socket, conn) do
-    cond do
-      too_big?(byte_size(data), conn.max_message) ->
-        fail(1009, :message_too_big, socket, conn)
-
-      op == :text and conn.utf8 and not String.valid?(data) ->
-        fail(1007, :invalid_utf8, socket, conn)
-
-      true ->
+  defp message(op, data, rsv1, socket, conn) do
+    case expand(op, data, rsv1, conn) do
+      {:ok, data, conn} ->
         callback(conn, :handle_in, [{data, opcode: op}]) |> result(socket, conn)
+
+      {:error, code, reason, conn} ->
+        fail(code, reason, socket, conn)
     end
   end
+
+  defp expand(op, data, false, conn) do
+    if too_big?(byte_size(data), conn.max_message),
+      do: {:error, 1009, :message_too_big, conn},
+      else: check_utf8(op, data, conn)
+  end
+
+  # The opcode is still text or binary after inflate; UTF-8 is checked
+  # on the decompressed text payload.
+  defp expand(op, data, true, conn) do
+    if too_big?(byte_size(data), conn.max_message) do
+      {:error, 1009, :message_too_big, conn}
+    else
+      case PerMessageDeflate.inflate(data, conn.compress, conn.max_message) do
+        {:ok, data, compress} ->
+          check_utf8(op, data, %{conn | compress: compress})
+
+        {:error, :message_too_big} ->
+          {:error, 1009, :message_too_big, conn}
+
+        {:error, _reason} ->
+          {:error, 1007, :bad_deflate, conn}
+      end
+    end
+  end
+
+  defp check_utf8(:text, data, %{utf8: true} = conn) do
+    if String.valid?(data),
+      do: {:ok, data, conn},
+      else: {:error, 1007, :invalid_utf8, conn}
+  end
+
+  defp check_utf8(_op, data, conn), do: {:ok, data, conn}
 
   defp control(op, data, socket, %__MODULE__{control?: true} = conn),
     do: callback(conn, :handle_control, [{data, opcode: op}]) |> result(socket, conn)
@@ -311,24 +392,48 @@ defmodule MuroPlug.WebSocket.Connection do
   end
 
   defp push(msgs, socket, conn) do
-    case Socket.send(socket, encode_all(msgs)) do
-      :ok -> {:continue, conn}
-      {:error, reason} -> {:close, terminate(%{conn | phase: :closed}, {:error, reason})}
+    case encode_all(msgs, conn) do
+      {:ok, data, conn} ->
+        case Socket.send(socket, data) do
+          :ok -> {:continue, conn}
+          {:error, reason} -> {:close, terminate(%{conn | phase: :closed}, {:error, reason})}
+        end
+
+      {:error, reason, conn} ->
+        _ = Socket.send(socket, close_frame(1011))
+        {:close, terminate(%{conn | phase: :closed}, {:error, reason})}
     end
   end
 
   # Send any last frames and the close, run terminate/2, then wait for
   # the client's close so the close frame is not lost to a reset.
+  # Compress first (while the :zlib streams are still open), then close
+  # them in terminate/2.
   defp stop(reason, detail, msgs, socket, conn) do
-    conn = terminate(conn, if(reason == :normal, do: :normal, else: {:error, reason}))
+    case encode_all(msgs, conn) do
+      {:ok, data, conn} ->
+        conn = terminate(conn, if(reason == :normal, do: :normal, else: {:error, reason}))
 
-    case Socket.send(socket, [encode_all(msgs), close_frame(detail)]) do
-      :ok ->
-        Process.send_after(self(), @close_timer, conn.close_timeout)
-        {:linger, %{conn | phase: :closing}}
+        case Socket.send(socket, [data, close_frame(detail)]) do
+          :ok ->
+            Process.send_after(self(), @close_timer, conn.close_timeout)
+            {:linger, %{conn | phase: :closing}}
 
-      {:error, _} ->
-        {:close, %{conn | phase: :closed}}
+          {:error, _} ->
+            {:close, %{conn | phase: :closed}}
+        end
+
+      {:error, _reason, conn} ->
+        conn = terminate(conn, if(reason == :normal, do: :normal, else: {:error, reason}))
+
+        case Socket.send(socket, close_frame(detail)) do
+          :ok ->
+            Process.send_after(self(), @close_timer, conn.close_timeout)
+            {:linger, %{conn | phase: :closing}}
+
+          {:error, _} ->
+            {:close, %{conn | phase: :closed}}
+        end
     end
   end
 
@@ -338,30 +443,64 @@ defmodule MuroPlug.WebSocket.Connection do
   defp code_for({:shutdown, _}), do: 1000
   defp code_for(_), do: 1011
 
-  defp encode_all(msgs) when is_list(msgs), do: Enum.map(msgs, &encode_one/1)
-  defp encode_all(msg), do: encode_one(msg)
+  defp encode_all(msgs, conn) when is_list(msgs) do
+    Enum.reduce_while(msgs, {:ok, [], conn}, fn msg, {:ok, acc, conn} ->
+      case encode_one(msg, conn) do
+        {:ok, data, conn} -> {:cont, {:ok, [acc, data], conn}}
+        {:error, reason, conn} -> {:halt, {:error, reason, conn}}
+      end
+    end)
+  end
 
-  defp encode_one({op, nil}) when op in [:text, :binary, :ping, :pong], do: Frame.encode(op, <<>>)
+  defp encode_all(msg, conn), do: encode_one(msg, conn)
 
-  defp encode_one({op, data}) when op in [:text, :binary, :ping, :pong],
-    do: Frame.encode(op, data)
+  defp encode_one({op, nil}, conn) when op in [:text, :binary, :ping, :pong],
+    do: encode_one({op, <<>>}, conn)
+
+  defp encode_one({op, data}, conn) when op in [:text, :binary] do
+    case maybe_deflate(data, conn) do
+      {:ok, data, rsv1?, conn} -> {:ok, Frame.encode(op, data, rsv1: rsv1?), conn}
+      {:error, reason, conn} -> {:error, reason, conn}
+    end
+  end
+
+  defp encode_one({op, data}, conn) when op in [:ping, :pong],
+    do: {:ok, Frame.encode(op, data), conn}
+
+  defp maybe_deflate(data, %__MODULE__{compress: nil} = conn), do: {:ok, data, false, conn}
+
+  defp maybe_deflate(data, %__MODULE__{compress: compress} = conn) do
+    case PerMessageDeflate.deflate(data, compress) do
+      {:ok, data, compress} -> {:ok, data, true, %{conn | compress: compress}}
+      {:error, reason} -> {:error, reason, conn}
+    end
+  end
 
   defp close_frame(code) when is_integer(code), do: Frame.encode(:close, <<code::16>>)
   defp close_frame({code, nil}), do: close_frame(code)
   defp close_frame({code, reason}), do: Frame.encode(:close, [<<code::16>>, reason])
 
-  defp terminate(%__MODULE__{terminate?: true, handler: h} = conn, reason) do
-    try do
-      h.terminate(reason, conn.hstate)
-    catch
-      kind, error ->
-        Logger.error(Exception.format(kind, error, __STACKTRACE__))
-    end
+  defp terminate(conn, reason) do
+    conn = close_compress(conn)
 
-    %{conn | terminate?: false, phase: closed_phase(conn)}
+    if conn.terminate? do
+      try do
+        conn.handler.terminate(reason, conn.hstate)
+      catch
+        kind, error ->
+          Logger.error(Exception.format(kind, error, __STACKTRACE__))
+      end
+
+      %{conn | terminate?: false, phase: closed_phase(conn)}
+    else
+      %{conn | phase: closed_phase(conn)}
+    end
   end
 
-  defp terminate(conn, _reason), do: %{conn | phase: closed_phase(conn)}
+  defp close_compress(%__MODULE__{compress: compress} = conn) do
+    PerMessageDeflate.close(compress)
+    %{conn | compress: nil}
+  end
 
   defp closed_phase(%__MODULE__{phase: :open}), do: :closed
   defp closed_phase(%__MODULE__{phase: phase}), do: phase

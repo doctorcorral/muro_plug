@@ -313,8 +313,8 @@ defmodule MuroPlug.WSClient do
   def send_frame(s, op, payload, opts \\ []),
     do: TestClient.send_bytes(s, frame(op, payload, opts))
 
-  # One server frame: {:ok, {fin, op, payload, length_code}, rest}. The
-  # server must not mask.
+  # One server frame: {:ok, {fin, op, payload, length_code, rsv}, rest}.
+  # The server must not mask. `rsv` is the 3-bit RSV field (4 = RSV1).
   def recv(s, buf \\ <<>>, timeout \\ 2_000) do
     case parse(buf) do
       {:ok, frame, rest} ->
@@ -328,7 +328,7 @@ defmodule MuroPlug.WSClient do
     end
   end
 
-  defp parse(<<fin::1, 0::3, code::4, 0::1, len7::7, rest::binary>>) do
+  defp parse(<<fin::1, rsv::3, code::4, 0::1, len7::7, rest::binary>>) do
     {len, rest} =
       case {len7, rest} do
         {126, <<n::16, r::binary>>} -> {n, r}
@@ -340,30 +340,103 @@ defmodule MuroPlug.WSClient do
     case rest do
       <<payload::binary-size(^len), tail::binary>> when is_integer(len) ->
         op = Enum.find_value(@ops, fn {k, v} -> if v == code, do: k end)
-        {:ok, {fin == 1, op, payload, len7}, tail}
+        {:ok, {fin == 1, op, payload, len7, rsv}, tail}
 
       _ ->
         :more
     end
   end
 
-  defp parse(<<_, 1::1, _::bitstring>>), do: raise("server frame is masked")
+  defp parse(<<_fin::1, _rsv::3, _code::4, 1::1, _::bitstring>>),
+    do: raise("server frame is masked")
+
   defp parse(_), do: :more
 
-  # The next frame's {op, payload}.
+  # The next uncompressed frame's {op, payload}.
   def next(s, buf \\ <<>>) do
-    {:ok, {true, op, payload, _}, rest} = recv(s, buf)
+    {:ok, {true, op, payload, _, 0}, rest} = recv(s, buf)
     {op, payload, rest}
+  end
+
+  # The next data frame, inflating RSV1 payloads with `z`.
+  def next_inflated(s, z, buf \\ <<>>, opts \\ []) do
+    {:ok, {true, op, payload, _, rsv}, rest} = recv(s, buf)
+    data = if rsv == 4, do: inflate(z, payload, opts), else: payload
+    {op, data, rest}
   end
 
   # Read the server's close frame: {code | nil, reason}.
   def close_frame(s, buf \\ <<>>) do
     case recv(s, buf) do
-      {:ok, {true, :close, <<code::16, reason::binary>>, _}, _} -> {code, reason}
-      {:ok, {true, :close, <<>>, _}, _} -> {nil, <<>>}
-      {:ok, {_, op, _, _}, rest} when op in [:ping, :pong, :text, :binary] -> close_frame(s, rest)
+      {:ok, {true, :close, <<code::16, reason::binary>>, _, _}, _} ->
+        {code, reason}
+
+      {:ok, {true, :close, <<>>, _, _}, _} ->
+        {nil, <<>>}
+
+      {:ok, {_, op, _, _, _}, rest} when op in [:ping, :pong, :text, :binary] ->
+        close_frame(s, rest)
     end
   end
+
+  # Client zlib helpers for RFC 7692 tests.
+  def inflate_stream(window_bits \\ 15) do
+    z = :zlib.open()
+    :ok = :zlib.inflateInit(z, MuroPlug.WebSocket.PerMessageDeflate.window(-window_bits))
+    z
+  end
+
+  def deflate_stream(window_bits \\ 15) do
+    z = :zlib.open()
+
+    :ok =
+      :zlib.deflateInit(
+        z,
+        :default,
+        :deflated,
+        MuroPlug.WebSocket.PerMessageDeflate.window(-window_bits),
+        8,
+        :default
+      )
+
+    z
+  end
+
+  def inflate(z, payload, opts \\ []) do
+    data = do_safe_inflate(z, :zlib.safeInflate(z, payload <> <<0x00, 0x00, 0xFF, 0xFF>>), [])
+    if Keyword.get(opts, :reset, false), do: :ok = :zlib.inflateReset(z)
+    data
+  end
+
+  def deflate(z, payload, opts \\ []) do
+    out = z |> :zlib.deflate(IO.iodata_to_binary(payload), :sync) |> IO.iodata_to_binary()
+    n = byte_size(out)
+
+    out =
+      if n >= 4 and binary_part(out, n - 4, 4) == <<0x00, 0x00, 0xFF, 0xFF>>,
+        do: binary_part(out, 0, n - 4),
+        else: out
+
+    if Keyword.get(opts, :reset, false), do: :ok = :zlib.deflateReset(z)
+    out
+  end
+
+  def close_z(z) do
+    :zlib.close(z)
+  rescue
+    _ -> :ok
+  end
+
+  def send_compressed(s, op, payload, z, opts \\ []) do
+    {frame_opts, inflate_opts} = Keyword.split(opts, [:fin, :rsv, :mask])
+    data = deflate(z, payload, inflate_opts)
+    send_frame(s, op, data, Keyword.put_new(frame_opts, :rsv, 4))
+  end
+
+  defp do_safe_inflate(z, {:continue, chunk}, acc),
+    do: do_safe_inflate(z, :zlib.safeInflate(z, <<>>), [acc, chunk])
+
+  defp do_safe_inflate(_z, {:finished, chunk}, acc), do: IO.iodata_to_binary([acc, chunk])
 end
 
 {:ok, _} = Application.ensure_all_started(:ssl)

@@ -14,9 +14,9 @@ The package will live under `doctorcorral` until launch, then move to
 
 HTTP/1.1 over TCP and over TLS (HTTPS), and WebSockets (RFC 6455,
 through `WebSock`) over both: `ws://` and `wss://`, including Phoenix
-channels and LiveView sockets. Not published to Hex. No HTTP/2: over
-TLS, ALPN advertises `http/1.1` only. No WebSocket compression
-(`permessage-deflate`) yet.
+channels and LiveView sockets, with optional RFC 7692
+`permessage-deflate`. Not published to Hex. No HTTP/2: over
+TLS, ALPN advertises `http/1.1` only.
 
 ## Usage
 
@@ -120,11 +120,13 @@ dependency already) is what applications call.
 * When the Plug returns, `MuroPlug.Handler` writes `101 Switching
   Protocols` with `Sec-WebSocket-Accept` and the response headers the
   Plug set (`set-cookie`, `sec-websocket-protocol`, ...; never a second
-  `upgrade`/`connection`/`sec-websocket-accept`, and never
-  `sec-websocket-extensions`), then runs
-  `MuroPlug.WebSocket.Connection` on the same `ThousandIsland.Socket`.
-  Bytes the client sent after the upgrade request (a pipelined first
-  frame) are the first frame bytes.
+  `upgrade`/`connection`/`sec-websocket-accept`, and never a
+  Plug-supplied `sec-websocket-extensions`). If `:compress` is enabled
+  and the client offered a valid RFC 7692 `permessage-deflate`, the 101
+  includes the negotiated `Sec-WebSocket-Extensions` value. Then it
+  runs `MuroPlug.WebSocket.Connection` on the same
+  `ThousandIsland.Socket`. Bytes the client sent after the upgrade
+  request (a pipelined first frame) are the first frame bytes.
 * Framing: client frames must be masked; server frames are not. 7-,
   16-, and 64-bit lengths; unmasking is one `:crypto.exor` over the
   payload binary. Text, binary, continuation, ping (answered with a pong
@@ -133,13 +135,14 @@ dependency already) is what applications call.
   between fragments; every 1024 fragments are folded into one binary,
   so many tiny fragments cannot pile up list cells. Text messages and close reasons must be UTF-8.
 * Failures close the connection with a close frame: 1002 for an
-  unmasked frame, RSV bits (no extension is negotiated), a reserved
+  unmasked frame, RSV2/RSV3, RSV1 on a continuation or control frame
+  or when `permessage-deflate` was not negotiated, a reserved
   opcode, a fragmented or over-125-byte control frame, an unexpected
   continuation or a data frame inside a fragmented message, a 1-byte
   close or a close code that may not be sent, a 64-bit length with
-  the high bit set, or a length not in its minimal encoding (§5.2); 1007 for invalid UTF-8; 1009 past
+  the high bit set, or a length not in its minimal encoding (§5.2); 1007 for invalid UTF-8 (including after inflate) or a corrupt deflate payload; 1009 past
   `:max_frame_size` (checked on the frame header) or
-  `:max_message_size`.
+  `:max_message_size` (including as inflated octets are produced).
 * `WebSock` callbacks: `init/1`, `handle_in/2`, `handle_control/2`
   (optional), `handle_info/2` for every other process message (PubSub,
   channel processes), `terminate/2` (optional, called once: `:normal`,
@@ -154,12 +157,19 @@ dependency already) is what applications call.
   then close 1001 and `terminate(:timeout, _)`), `:max_frame_size`
   (default 10_000_000), `:max_message_size` (default the frame limit),
   `:validate_utf8` (default `true`), `:close_timeout` (default 5_000
-  ms), `:fullsweep_after`, `:max_heap_size`. `:compress` is accepted and
-  ignored: `permessage-deflate` is never advertised. A known option
-  with a bad value (e.g. `close_timeout: :infinity`) raises
+  ms), `:fullsweep_after`, `:max_heap_size` (an integer or a map with
+  `:size` and optional `:kill`, `:error_logger`,
+  `:include_shared_binaries`). `:compress` (`false` by default; `true`
+  or a keyword list of `:zlib` options) negotiates RFC 7692
+  `permessage-deflate` when the client offers it, compresses outgoing
+  data frames, and inflates incoming RSV1 data messages. A known option
+  with a bad value (e.g. `close_timeout: :infinity` or
+  `max_heap_size: %{size: -1}`) raises
   `ArgumentError` from the upgrade, before the 101; unknown keys (Phoenix
   passes its whole socket config) are ignored. An upgrade request whose
-  streamed body is still unread gets `400` and a close. A server shutdown
+  body is still unread — a streamed body on the wire, or a fully-buffered
+  non-empty body the Plug never read — gets `400` and a close. An empty
+  or already-read body still upgrades. A server shutdown
   closes open WebSockets with 1001.
 
 ## How it fits together
@@ -258,14 +268,14 @@ response headers on the 101, rejected upgrades (400/426), text and
 binary echo, 16- and 64-bit lengths, fragmentation with pings between
 fragments, 2000 one-byte fragments (exact reassembly, bounded state),
 one-byte packets, a first frame pipelined with the upgrade request, an
-upgrade with an unread streamed body, option validation, a client that
+upgrade with an unread streamed or fully-buffered body, option validation (including a `max_heap_size` map), RFC 7692 `permessage-deflate` negotiation and compressed echo (zip bombs, corrupt deflate, RSV1 misuse), a client that
 never answers the server's close (`close_timeout`), each 1002/1007/1009 failure above, `handle_info/2` pushes,
 `handle_control/2`, `terminate/2` on client close, server stop,
 timeout, a dropped socket and server shutdown, close codes and reasons,
 a raising callback, and a `Phoenix.Endpoint` with both `http:` and
 `https:` serving a `Phoenix.Socket.Transport` and a `Phoenix.Socket`
 channel (join, reply, a 70 KB broadcast, heartbeat) over `ws://` and
-`wss://`.
+`wss://`, including with `compress: true`.
 
 ## Performance
 

@@ -113,8 +113,26 @@ defmodule MuroPlug.WebSocketTest do
     defp route(["bad_opts"], conn, opts),
       do: WebSockAdapter.upgrade(conn, Echo, %{test: opts.test}, close_timeout: :infinity)
 
+    defp route(["bad_heap"], conn, opts),
+      do: WebSockAdapter.upgrade(conn, Echo, %{test: opts.test}, max_heap_size: %{size: -1})
+
     defp route(["minimal"], conn, _opts), do: WebSockAdapter.upgrade(conn, Minimal, nil, [])
     defp route(["init_push"], conn, _opts), do: WebSockAdapter.upgrade(conn, InitPush, nil, [])
+
+    defp route(["deflate"], conn, opts),
+      do: WebSockAdapter.upgrade(conn, Echo, %{test: opts.test}, compress: true)
+
+    defp route(["deflate_small"], conn, opts),
+      do:
+        WebSockAdapter.upgrade(conn, Echo, %{test: opts.test},
+          compress: true,
+          max_message_size: 2_000
+        )
+
+    defp route(["read_body"], conn, opts) do
+      {:ok, _body, conn} = Plug.Conn.read_body(conn)
+      WebSockAdapter.upgrade(conn, Echo, %{test: opts.test}, [])
+    end
 
     defp route(["bad_spec"], conn, _opts), do: upgrade_adapter(conn, :websocket, :nope)
 
@@ -190,15 +208,17 @@ defmodule MuroPlug.WebSocketTest do
       assert TestClient.header(resp, "sec-websocket-protocol") == "chat"
       assert TestClient.header(resp, "x-custom") == "yes"
       assert TestClient.header(resp, "set-cookie") =~ "session=abc"
-      # No extension is negotiated, even when the client offers one.
-      refute TestClient.header(resp, "sec-websocket-extensions")
+      # The Plug-set extensions header is not copied; the negotiated one is sent once.
+      assert TestClient.header(resp, "sec-websocket-extensions") == "permessage-deflate"
 
-      for name <- ~w(upgrade connection sec-websocket-accept) do
+      for name <- ~w(upgrade connection sec-websocket-accept sec-websocket-extensions) do
         assert Enum.count(resp.headers, fn {k, _} -> String.downcase(k) == name end) == 1
       end
 
+      z = inflate_stream()
       :ok = send_frame(s, :text, "ok")
-      assert {:text, "ok", _} = next(s)
+      assert {:text, "ok", _} = next_inflated(s, z)
+      close_z(z)
     end
 
     test "Upgrade and Connection tokens are case-insensitive and may be in a list", ctx do
@@ -267,6 +287,36 @@ defmodule MuroPlug.WebSocketTest do
       end
     end
 
+    test "an upgrade with a fully-buffered unread body gets 400 and a close", ctx do
+      {_key, req} = upgrade_request("/ws", headers: [{"Content-Length", "5"}])
+      s = open(ctx.port, ctx.scheme)
+      :ok = TestClient.send_bytes(s, req <> "hello")
+      {:ok, r, _} = TestClient.read(s)
+      assert r.status == 400
+      assert TestClient.header(r, "connection") == "close"
+      assert closed?(s)
+      refute_received {:init, _}
+    end
+
+    test "an empty or already-read body still upgrades", ctx do
+      {_key, empty} = upgrade_request("/ws", headers: [{"Content-Length", "0"}])
+      s = open(ctx.port, ctx.scheme)
+      :ok = TestClient.send_bytes(s, empty)
+      {:ok, resp, _} = TestClient.read(s)
+      assert resp.status == 101
+      assert_receive {:init, _}
+      TestClient.close(s)
+
+      {_key, req} = upgrade_request("/read_body", headers: [{"Content-Length", "5"}])
+      s = open(ctx.port, ctx.scheme)
+      :ok = TestClient.send_bytes(s, req <> "hello")
+      {:ok, resp, _} = TestClient.read(s)
+      assert resp.status == 101
+      assert_receive {:init, _}
+      :ok = send_frame(s, :text, "after")
+      assert {:text, "after", _} = next(s)
+    end
+
     test "WebSockAdapter's own validation failure is a 400", ctx do
       {_key, req} = upgrade_request("/ws", drop: ["Sec-WebSocket-Key"])
       r = raw(ctx, req)
@@ -287,7 +337,7 @@ defmodule MuroPlug.WebSocketTest do
       for size <- [125, 126, 65_535, 65_536, 300_000] do
         data = :crypto.strong_rand_bytes(size)
         :ok = send_frame(s, :binary, data)
-        {:ok, {true, :binary, ^data, len7}, <<>>} = recv(s, <<>>, 5_000)
+        {:ok, {true, :binary, ^data, len7, 0}, <<>>} = recv(s, <<>>, 5_000)
 
         assert len7 == len_code(size)
       end
@@ -334,7 +384,7 @@ defmodule MuroPlug.WebSocketTest do
       :ok = send_frame(s, :ping, "sync")
       assert {:pong, "sync", _} = next(s)
 
-      {_socket, %MuroPlug.WebSocket.Connection{frag: {:binary, chunks, n, size}}} =
+      {_socket, %MuroPlug.WebSocket.Connection{frag: {:binary, chunks, n, size, false}}} =
         :sys.get_state(pid)
 
       assert size == 1500
@@ -348,7 +398,7 @@ defmodule MuroPlug.WebSocketTest do
         ])
 
       expected = IO.iodata_to_binary(bytes)
-      {:ok, {true, :binary, got, _}, _} = recv(s, <<>>, 5_000)
+      {:ok, {true, :binary, got, _, 0}, _} = recv(s, <<>>, 5_000)
       assert is_binary(got) and got == expected
       assert_receive {:in, :binary, 2000}
     end
@@ -586,6 +636,249 @@ defmodule MuroPlug.WebSocketTest do
     end
   end
 
+  describe "permessage-deflate" do
+    @offer [{"Sec-WebSocket-Extensions", "permessage-deflate"}]
+
+    defp deflate_up(ctx, path \\ "/deflate", opts \\ []) do
+      headers = Keyword.get(opts, :headers, @offer)
+      up(ctx, path, Keyword.put(opts, :headers, headers))
+    end
+
+    defp ext(resp), do: TestClient.header(resp, "sec-websocket-extensions")
+
+    test "compress: true negotiates a bare permessage-deflate offer", ctx do
+      %{s: s, resp: resp} = deflate_up(ctx)
+      assert ext(resp) == "permessage-deflate"
+      z_in = inflate_stream()
+      z_out = deflate_stream()
+      :ok = send_compressed(s, :text, "héllo", z_out)
+      assert {:text, "héllo", _} = next_inflated(s, z_in)
+      :ok = send_compressed(s, :binary, <<0, 1, 255>>, z_out)
+      assert {:binary, <<0, 1, 255>>, _} = next_inflated(s, z_in)
+      close_z(z_in)
+      close_z(z_out)
+    end
+
+    test "compress: false never advertises Sec-WebSocket-Extensions", ctx do
+      %{s: s, resp: resp} = up(ctx, "/ws", headers: @offer)
+      refute ext(resp)
+      :ok = send_frame(s, :text, "plain")
+      assert {:text, "plain", _} = next(s)
+    end
+
+    test "no offer means no extension even when compress is true", ctx do
+      %{s: s, resp: resp} = up(ctx, "/deflate")
+      refute ext(resp)
+      :ok = send_frame(s, :text, "plain")
+      assert {:text, "plain", _} = next(s)
+    end
+
+    test "client_no_context_takeover and server_no_context_takeover are echoed", ctx do
+      %{s: s, resp: resp} =
+        deflate_up(ctx, "/deflate",
+          headers: [
+            {"Sec-WebSocket-Extensions",
+             "permessage-deflate; client_no_context_takeover; server_no_context_takeover"}
+          ]
+        )
+
+      assert ext(resp) ==
+               "permessage-deflate; server_no_context_takeover; client_no_context_takeover"
+
+      z_in = inflate_stream()
+      z_out = deflate_stream()
+
+      for msg <- ["alpha", "alpha", "beta"] do
+        :ok = send_compressed(s, :text, msg, z_out, reset: true)
+        assert {:text, ^msg, _} = next_inflated(s, z_in, <<>>, reset: true)
+      end
+
+      close_z(z_in)
+      close_z(z_out)
+    end
+
+    test "context takeover keeps the inflate/deflate dictionary across messages", ctx do
+      %{s: s, resp: resp} = deflate_up(ctx)
+      assert ext(resp) == "permessage-deflate"
+      z_in = inflate_stream()
+      z_out = deflate_stream()
+      payload = String.duplicate("the same dictionary phrase ", 20)
+      :ok = send_compressed(s, :text, payload, z_out)
+      assert {:text, ^payload, _} = next_inflated(s, z_in)
+      :ok = send_compressed(s, :text, payload, z_out)
+      assert {:text, ^payload, _} = next_inflated(s, z_in)
+      close_z(z_in)
+      close_z(z_out)
+    end
+
+    test "client_max_window_bits and server_max_window_bits are negotiated", ctx do
+      %{s: s, resp: resp} =
+        deflate_up(ctx, "/deflate",
+          headers: [
+            {"Sec-WebSocket-Extensions",
+             "permessage-deflate; client_max_window_bits=12; server_max_window_bits=10"}
+          ]
+        )
+
+      assert ext(resp) ==
+               "permessage-deflate; server_max_window_bits=10; client_max_window_bits=12"
+
+      z_in = inflate_stream(10)
+      z_out = deflate_stream(12)
+      :ok = send_compressed(s, :text, "windows", z_out)
+      assert {:text, "windows", _} = next_inflated(s, z_in)
+      close_z(z_in)
+      close_z(z_out)
+    end
+
+    test "a valueless client_max_window_bits is accepted", ctx do
+      %{resp: resp} =
+        deflate_up(ctx, "/deflate",
+          headers: [{"Sec-WebSocket-Extensions", "permessage-deflate; client_max_window_bits"}]
+        )
+
+      assert ext(resp) == "permessage-deflate; client_max_window_bits=15"
+    end
+
+    test "the first invalid offer is skipped in favour of a later valid one", ctx do
+      %{s: s, resp: resp} =
+        deflate_up(ctx, "/deflate",
+          headers: [
+            {"Sec-WebSocket-Extensions",
+             "permessage-deflate; foo=1, permessage-deflate; client_no_context_takeover"}
+          ]
+        )
+
+      assert ext(resp) == "permessage-deflate; client_no_context_takeover"
+      z_in = inflate_stream()
+      z_out = deflate_stream()
+      :ok = send_compressed(s, :binary, <<1, 2, 3>>, z_out, reset: true)
+      assert {:binary, <<1, 2, 3>>, _} = next_inflated(s, z_in, <<>>, reset: true)
+      close_z(z_in)
+      close_z(z_out)
+    end
+
+    test "an unknown extension is ignored and a later offer can still match", ctx do
+      %{resp: resp} =
+        deflate_up(ctx, "/deflate",
+          headers: [
+            {"Sec-WebSocket-Extensions", "mux"},
+            {"Sec-WebSocket-Extensions", "permessage-deflate"}
+          ]
+        )
+
+      assert ext(resp) == "permessage-deflate"
+    end
+
+    test "if no offer is acceptable the upgrade proceeds uncompressed", ctx do
+      %{s: s, resp: resp} =
+        deflate_up(ctx, "/deflate",
+          headers: [
+            {"Sec-WebSocket-Extensions",
+             "permessage-deflate; server_max_window_bits=99, permessage-deflate; unknown=1"}
+          ]
+        )
+
+      refute ext(resp)
+      :ok = send_frame(s, :text, "fallback")
+      assert {:text, "fallback", _} = next(s)
+    end
+
+    test "an uncompressed message is accepted alongside a negotiated extension", ctx do
+      %{s: s, resp: resp} = deflate_up(ctx)
+      assert ext(resp)
+      z_in = inflate_stream()
+      :ok = send_frame(s, :text, "not compressed")
+      assert {:text, "not compressed", _} = next_inflated(s, z_in)
+      close_z(z_in)
+    end
+
+    test "a large compressible payload round-trips", ctx do
+      %{s: s} = deflate_up(ctx)
+      payload = String.duplicate("0123456789abcdef", 8_000)
+      z_in = inflate_stream()
+      z_out = deflate_stream()
+      :ok = send_compressed(s, :text, payload, z_out)
+      assert {:text, ^payload, _} = next_inflated(s, z_in, <<>>)
+      assert_receive {:in, :text, size} when size == byte_size(payload)
+      close_z(z_in)
+      close_z(z_out)
+    end
+
+    test "a fragmented compressed message with an interleaved ping", ctx do
+      %{s: s} = deflate_up(ctx)
+      z_in = inflate_stream()
+      z_out = deflate_stream()
+      payload = String.duplicate("frag-me", 50)
+      compressed = deflate(z_out, payload)
+      mid = div(byte_size(compressed), 2)
+      <<first::binary-size(^mid), rest::binary>> = compressed
+      :ok = send_frame(s, :text, first, fin: false, rsv: 4)
+      :ok = send_frame(s, :ping, "mid")
+      assert {:pong, "mid", _} = next(s)
+      :ok = send_frame(s, :continuation, rest)
+      assert {:text, ^payload, _} = next_inflated(s, z_in)
+      close_z(z_in)
+      close_z(z_out)
+    end
+
+    test "RSV1 without negotiation closes with 1002", ctx do
+      %{s: s} = up(ctx)
+      :ok = send_frame(s, :text, "x", rsv: 4)
+      assert {1002, ""} = close_frame(s)
+      assert_receive {:terminate, {:error, :reserved_bits}}
+    end
+
+    test "RSV1 on a continuation closes with 1002", ctx do
+      %{s: s} = deflate_up(ctx)
+      z_out = deflate_stream()
+      data = deflate(z_out, "hello there")
+      <<a::binary-size(2), b::binary>> = data
+      :ok = send_frame(s, :text, a, fin: false, rsv: 4)
+      :ok = send_frame(s, :continuation, b, rsv: 4)
+      assert {1002, ""} = close_frame(s)
+      assert_receive {:terminate, {:error, :reserved_bits}}
+      close_z(z_out)
+    end
+
+    test "RSV1 on a ping or close closes with 1002", ctx do
+      %{s: s} = deflate_up(ctx)
+      :ok = send_frame(s, :ping, "x", rsv: 4)
+      assert {1002, ""} = close_frame(s)
+      assert_receive {:terminate, {:error, :reserved_bits}}
+
+      %{s: s} = deflate_up(ctx)
+      :ok = send_frame(s, :close, <<1000::16>>, rsv: 4)
+      assert {1002, ""} = close_frame(s)
+      assert_receive {:terminate, {:error, :reserved_bits}}
+    end
+
+    test "a zip bomb past max_message_size closes with 1009", ctx do
+      %{s: s} = deflate_up(ctx, "/deflate_small")
+      z_out = deflate_stream()
+      :ok = send_compressed(s, :binary, :binary.copy(<<0>>, 100_000), z_out)
+      assert {1009, ""} = close_frame(s)
+      assert_receive {:terminate, {:error, :message_too_big}}
+      close_z(z_out)
+    end
+
+    test "a corrupt deflate payload closes with 1007", ctx do
+      %{s: s} = deflate_up(ctx)
+      :ok = send_frame(s, :text, :crypto.strong_rand_bytes(32), rsv: 4)
+      assert {1007, ""} = close_frame(s)
+      assert_receive {:terminate, {:error, :bad_deflate}}
+    end
+
+    test "invalid UTF-8 after inflate closes with 1007", ctx do
+      %{s: s} = deflate_up(ctx)
+      z_out = deflate_stream()
+      :ok = send_compressed(s, :text, <<0xFF, 0xFE>>, z_out)
+      assert {1007, ""} = close_frame(s)
+      assert_receive {:terminate, {:error, :invalid_utf8}}
+      close_z(z_out)
+    end
+  end
+
   defp len_code(size) when size < 126, do: size
   defp len_code(size) when size < 65_536, do: 126
   defp len_code(_size), do: 127
@@ -638,6 +931,18 @@ defmodule MuroPlug.WebSocketLogTest do
     refute_received {:init, _}
   end
 
+  test "an invalid max_heap_size map raises before the 101", ctx do
+    {_key, req} = upgrade_request("/bad_heap")
+
+    log =
+      capture_log(fn ->
+        assert raw(ctx, req).status == 500
+      end)
+
+    assert log =~ ":max_heap_size must be"
+    refute_received {:init, _}
+  end
+
   test "a raising handle_in closes with 1011 and logs", ctx do
     {s, _resp, <<>>} = connect(ctx.port, ctx.scheme)
     assert_receive {:init, _}
@@ -684,14 +989,25 @@ defmodule MuroPlug.WebSocketFrameTest do
              IO.iodata_to_binary(Frame.encode(:binary, big))
 
     assert IO.iodata_to_binary(Frame.encode(:close, <<1000::16>>)) == <<0x88, 2, 1000::16>>
+    assert IO.iodata_to_binary(Frame.encode(:text, "hi", rsv1: true)) == <<0xC1, 2, "hi">>
   end
 
   test "parse unmasks, waits for the whole frame, and keeps the tail" do
     f = MuroPlug.WSClient.frame(:text, "hello")
-    assert {:ok, {true, :text, "hello"}, "tail"} = Frame.parse(f <> "tail", 100)
+    assert {:ok, {true, :text, "hello", false}, "tail"} = Frame.parse(f <> "tail", 100)
 
     for n <- 0..(byte_size(f) - 1) do
       assert Frame.parse(binary_part(f, 0, n), 100) == :more
+    end
+  end
+
+  test "parse returns RSV1 and rejects RSV2/RSV3" do
+    f = MuroPlug.WSClient.frame(:text, "x", rsv: 4)
+    assert {:ok, {true, :text, "x", true}, <<>>} = Frame.parse(f, 100)
+
+    for rsv <- [1, 2, 3, 5, 6, 7] do
+      assert {:error, 1002, :reserved_bits} =
+               Frame.parse(MuroPlug.WSClient.frame(:text, "x", rsv: rsv), 100)
     end
   end
 
@@ -721,10 +1037,19 @@ defmodule MuroPlug.WebSocketFrameTest do
              close_timeout: 0,
              validate_utf8: false,
              compress: true,
+             deflate_options: [level: :best_speed, mem_level: 8, strategy: :default],
              fullsweep_after: nil,
-             max_heap_size: %{size: 1_000_000},
+             max_heap_size: %{
+               size: 1_000_000,
+               kill: true,
+               error_logger: false,
+               include_shared_binaries: true
+             },
              connect_info: [:peer_data]
            ) == :ok
+
+    assert Connection.validate_opts!(compress: [level: 6, mem_level: 1]) == :ok
+    assert Connection.validate_opts!(max_heap_size: 0) == :ok
 
     for bad <- [
           close_timeout: :infinity,
@@ -736,8 +1061,15 @@ defmodule MuroPlug.WebSocketFrameTest do
           max_message_size: -1,
           validate_utf8: 1,
           compress: nil,
+          compress: :yes,
           fullsweep_after: -1,
-          max_heap_size: :lots
+          max_heap_size: :lots,
+          max_heap_size: %{size: -1},
+          max_heap_size: %{foo: 1},
+          max_heap_size: %{},
+          max_heap_size: %{kill: true},
+          max_heap_size: %{size: 1, unknown: true},
+          max_heap_size: %{size: 1, kill: :yes}
         ] do
       assert_raise ArgumentError, ~r/WebSocket option/, fn -> Connection.validate_opts!([bad]) end
     end
@@ -824,6 +1156,8 @@ defmodule MuroPlug.PhoenixWebSocketTest do
 
     socket("/raw", RawSocket, websocket: true)
     socket("/socket", UserSocket, websocket: true)
+    socket("/raw_c", RawSocket, websocket: [compress: true])
+    socket("/socket_c", UserSocket, websocket: [compress: true])
   end
 
   setup_all do
@@ -917,6 +1251,62 @@ defmodule MuroPlug.PhoenixWebSocketTest do
       :ok = send_frame(s, :close, <<1000::16>>)
       assert {1000, ""} = close_frame(s)
       assert TestClient.closed?(s)
+    end
+  end
+
+  test "a Phoenix.Socket channel works with compress: true over ws:// and wss://", %{
+    ports: ports
+  } do
+    offer = [{"Sec-WebSocket-Extensions", "permessage-deflate"}]
+
+    for scheme <- [:ws, :wss] do
+      {s, resp, <<>>} =
+        connect(ports[scheme], scheme, "/socket_c/websocket?vsn=2.0.0&user=ric", headers: offer)
+
+      assert TestClient.header(resp, "sec-websocket-extensions") == "permessage-deflate"
+      z = inflate_stream()
+      topic = "room:#{scheme}-c"
+
+      :ok = send_frame(s, :text, JSON.encode!(["1", "1", topic, "phx_join", %{"hello" => "w"}]))
+      {:text, reply, _} = next_inflated(s, z)
+
+      assert ["1", "1", ^topic, "phx_reply", %{"status" => "ok", "response" => response}] =
+               JSON.decode!(reply)
+
+      assert response == %{"joined" => true, "got" => %{"hello" => "w"}, "user" => "ric"}
+
+      :ok = send_frame(s, :text, JSON.encode!(["1", "2", topic, "ping", %{"n" => 1}]))
+      {:text, reply, _} = next_inflated(s, z)
+
+      assert [
+               "1",
+               "2",
+               ^topic,
+               "phx_reply",
+               %{"status" => "ok", "response" => %{"pong" => %{"n" => 1}}}
+             ] = JSON.decode!(reply)
+
+      Endpoint.broadcast!(topic, "news", %{"big" => String.duplicate("x", 70_000)})
+      {:text, push, _} = next_inflated(s, z)
+      assert [nil, nil, ^topic, "news", %{"big" => big}] = JSON.decode!(push)
+      assert byte_size(big) == 70_000
+
+      {s2, resp2, <<>>} =
+        connect(ports[scheme], scheme, "/raw_c/websocket?name=ric", headers: offer)
+
+      assert TestClient.header(resp2, "sec-websocket-extensions")
+      assert_receive {:raw_init, _pid}
+      :ok = send_frame(s2, :text, "hi #{scheme}")
+      expected = "ric:hi #{scheme}"
+      z2 = inflate_stream()
+      assert {:text, ^expected, _} = next_inflated(s2, z2)
+      close_z(z2)
+      :ok = send_frame(s2, :close, <<1000::16>>)
+      assert {1000, ""} = close_frame(s2)
+
+      :ok = send_frame(s, :close, <<1000::16>>)
+      assert {1000, ""} = close_frame(s)
+      close_z(z)
     end
   end
 

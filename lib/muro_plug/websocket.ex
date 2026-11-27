@@ -38,14 +38,27 @@ defmodule MuroPlug.WebSocket do
       to wait for the client's close before dropping the socket.
       Defaults to `5_000`.
     * `:fullsweep_after`, `:max_heap_size` — process flags for the
-      connection process.
+      connection process. A `max_heap_size` map must have a
+      non-negative integer `:size` and may have `:kill`,
+      `:error_logger`, and `:include_shared_binaries` booleans
+      (Erlang's `Process.flag/2`); unknown keys or a negative `:size`
+      raise `ArgumentError` before the 101.
+    * `:compress` — negotiate RFC 7692 `permessage-deflate` when the
+      client offers it. `false` (the default) never advertises
+      `Sec-WebSocket-Extensions`. `true`, or a keyword list of
+      `:zlib` deflate options (`:level`, `:mem_level`, `:strategy`),
+      accepts a valid offer and compresses outgoing data frames
+      (RSV1). Control frames are never compressed. `:deflate_options`
+      (or `:deflate_opts`) is the same keyword list when `:compress`
+      is `true`. Frames with RSV1 set without a negotiated extension,
+      or RSV1 on a continuation or control frame, close with 1002.
+      A corrupt deflate payload or invalid UTF-8 after inflate closes
+      with 1007; inflated bytes past `:max_message_size` close with
+      1009.
 
   Known options with bad values (e.g. `close_timeout: :infinity`)
   raise `ArgumentError` from the upgrade, before the 101; unknown keys
   are ignored.
-    * `:compress` — accepted and ignored: no extension is negotiated,
-      `permessage-deflate` is never advertised, and frames with RSV
-      bits set are a protocol error (1002).
   """
 
   @guid "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -142,20 +155,29 @@ defmodule MuroPlug.WebSocket do
 
   @doc false
   # The 101 response: the upgrade headers, then the Plug's response
-  # headers without any it must not repeat or that would claim an
-  # extension (none is negotiated).
-  @spec handshake(binary(), Plug.Conn.headers()) :: iodata()
-  def handshake(key, resp_headers) do
+  # headers without any it must not repeat. A Plug-supplied
+  # `sec-websocket-extensions` is dropped; `extension` is the
+  # negotiated `permessage-deflate` value, if any.
+  @spec handshake(binary(), Plug.Conn.headers(), binary() | nil) :: iodata()
+  def handshake(key, resp_headers, extension \\ nil) do
     headers =
       Enum.reject(resp_headers, fn {k, _} ->
         lower(k) in ~w(connection upgrade sec-websocket-accept sec-websocket-extensions
                        content-length transfer-encoding)
       end)
 
-    MuroPlug.HTTP.head(:"HTTP/1.1", 101, headers, [
-      {"upgrade", "websocket"},
-      {"connection", "Upgrade"},
-      {"sec-websocket-accept", accept(key)}
-    ])
+    extra =
+      [
+        {"upgrade", "websocket"},
+        {"connection", "Upgrade"},
+        {"sec-websocket-accept", accept(key)}
+      ] ++ extension_header(extension)
+
+    MuroPlug.HTTP.head(:"HTTP/1.1", 101, headers, extra)
   end
+
+  defp extension_header(value) when is_binary(value) and value != "",
+    do: [{"sec-websocket-extensions", value}]
+
+  defp extension_header(_), do: []
 end

@@ -2,29 +2,32 @@ defmodule MuroPlug.WebSocket.Frame do
   @moduledoc false
   # RFC 6455 §5 framing. Frames, payloads and masks are binaries; the
   # mask is applied with one :crypto.exor over the whole payload.
+  # RSV1 (0x40) is returned so the connection can apply RFC 7692; RSV2
+  # and RSV3 are always a protocol error.
 
   @type opcode :: :continuation | :text | :binary | :close | :ping | :pong
-  @type frame :: {fin :: boolean(), opcode(), payload :: binary()}
+  @type frame :: {fin :: boolean(), opcode(), payload :: binary(), rsv1 :: boolean()}
   @type error :: {:error, 1002 | 1009, atom()}
 
   @doc """
   One client frame from the front of `buf`: `{:ok, frame, rest}` with
   the payload unmasked, `:more` when the frame is not all here yet, or
   `{:error, close_code, reason}` as soon as the header shows a
-  violation (before its payload arrives).
+  violation (before its payload arrives). RSV2/RSV3 close with 1002;
+  RSV1 is the fourth element of the frame.
   """
   @spec parse(binary(), non_neg_integer() | :infinity) ::
           {:ok, frame(), binary()} | :more | error()
   def parse(<<fin::1, rsv::3, op::4, mask::1, len7::7, rest::binary>>, max) do
     with {:ok, opcode} <- opcode(op),
-         :ok <- rsv(rsv),
+         {:ok, rsv1} <- rsv(rsv),
          :ok <- masked(mask),
          {:ok, len, rest} <- payload_length(len7, rest),
          :ok <- control(opcode, fin, len),
          :ok <- fits(len, max) do
       case rest do
         <<key::binary-size(4), payload::binary-size(^len), tail::binary>> ->
-          {:ok, {fin == 1, opcode, unmask(payload, key)}, tail}
+          {:ok, {fin == 1, opcode, unmask(payload, key), rsv1}, tail}
 
         _ ->
           :more
@@ -42,8 +45,9 @@ defmodule MuroPlug.WebSocket.Frame do
   defp opcode(0xA), do: {:ok, :pong}
   defp opcode(_reserved), do: {:error, 1002, :reserved_opcode}
 
-  # No extension is negotiated, so every RSV bit must be 0.
-  defp rsv(0), do: :ok
+  # RSV1 is the 0x4 bit; RSV2 (0x2) and RSV3 (0x1) are never negotiated.
+  defp rsv(0), do: {:ok, false}
+  defp rsv(4), do: {:ok, true}
   defp rsv(_), do: {:error, 1002, :reserved_bits}
 
   # §5.1: a client frame must be masked.
@@ -88,10 +92,11 @@ defmodule MuroPlug.WebSocket.Frame do
     :crypto.exor(payload, binary_part(:binary.copy(key, div(n + 3, 4)), 0, n))
   end
 
-  @doc "An unmasked, final server frame."
-  @spec encode(opcode(), iodata()) :: iodata()
-  def encode(opcode, payload) do
-    [<<1::1, 0::3, code(opcode)::4>>, length_bytes(IO.iodata_length(payload)), payload]
+  @doc "An unmasked, final server frame. Set `rsv1: true` for a compressed data frame."
+  @spec encode(opcode(), iodata(), keyword()) :: iodata()
+  def encode(opcode, payload, opts \\ []) do
+    rsv1 = if Keyword.get(opts, :rsv1, false), do: 1, else: 0
+    [<<1::1, rsv1::1, 0::2, code(opcode)::4>>, length_bytes(IO.iodata_length(payload)), payload]
   end
 
   defp code(:continuation), do: 0x0
