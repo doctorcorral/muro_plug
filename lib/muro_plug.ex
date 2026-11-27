@@ -4,7 +4,7 @@ defmodule MuroPlug do
   book.
 
   `priv/muro/http/step.muro` (and the `request.muro` it imports) are
-  pinned copies of the muro-http books. `mix step.gen` emits them with
+  pinned copies of the muro-http books. `mix muro.gen` emits them with
   muro's default Elixir backend into `MuroPlug.Step`. The Thousand
   Island handler (`MuroPlug.Handler`) feeds every socket event to that
   emitted step as a fact and does what the step's `Out` says. The

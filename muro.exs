@@ -1,5 +1,5 @@
 [
-  muro: "0.22.36",
+  muro: "0.22.38",
   fuel: 5_000_000,
   modules: [
     {"priv/muro/http/step.muro", MuroPlug.Step, "lib/muro_plug/step.ex"},
