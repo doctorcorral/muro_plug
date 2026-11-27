@@ -304,6 +304,14 @@ defmodule MuroPlug.Adapter do
   def body_open?(%__MODULE__{body: {:chunked, _, _}}), do: true
   def body_open?(%__MODULE__{}), do: false
 
+  @doc false
+  # A WebSocket upgrade must not leave a request body unread: a streamed
+  # body still on the wire, or a fully-buffered non-empty body the Plug
+  # never read. An empty `{:buffered, ""}` or an already-read body is
+  # fine.
+  def unread_body?(%__MODULE__{body: {:buffered, body}}), do: byte_size(body) > 0
+  def unread_body?(p), do: body_open?(p)
+
   # Ask the book how to frame this response.
   defp hand(p, status, headers, pull) do
     Book.hand(p.req,

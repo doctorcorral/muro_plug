@@ -294,16 +294,17 @@ defmodule MuroPlug.Handler do
          socket,
          state
        ) do
-    if Adapter.body_open?(p) do
+    if Adapter.unread_body?(p) do
       Socket.send(socket, HTTP.status_close(400))
       {:close, state}
     else
       tail = if p.leftover != <<>>, do: p.leftover, else: tail
       Process.put(Adapter.sent_key(), true)
+      {extension, compress} = negotiate_deflate(p.headers, opts)
 
-      case Socket.send(socket, MuroPlug.WebSocket.handshake(key, conn.resp_headers)) do
+      case Socket.send(socket, MuroPlug.WebSocket.handshake(key, conn.resp_headers, extension)) do
         :ok ->
-          ws = Connection.new(mod, opts)
+          ws = Connection.new(mod, opts, compress)
 
           case Connection.init(ws, ws_state, tail, socket) do
             {:close, ws} -> {:close, ws}
@@ -313,6 +314,13 @@ defmodule MuroPlug.Handler do
         {:error, _} ->
           {:close, state}
       end
+    end
+  end
+
+  defp negotiate_deflate(headers, opts) do
+    case MuroPlug.WebSocket.PerMessageDeflate.negotiate(headers, opts) do
+      {:ok, params} -> {MuroPlug.WebSocket.PerMessageDeflate.header(params), params}
+      :none -> {nil, nil}
     end
   end
 
