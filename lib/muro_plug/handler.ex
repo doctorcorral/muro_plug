@@ -17,6 +17,14 @@ defmodule MuroPlug.Handler do
   The receive buffer is one binary. Request views, framing ends and
   header-block ends all come from the book.
 
+  A Plug that upgrades to WebSocket (`Plug.Conn.upgrade_adapter/3`
+  with `:websocket`, e.g. through `WebSockAdapter.upgrade/4`) leaves the
+  book here: once the Plug returns, the handler writes the
+  `101 Switching Protocols` and the connection becomes a
+  `MuroPlug.WebSocket.Connection`. Any bytes after the upgrade request
+  are its first frame bytes. Process messages go to the `WebSock`
+  module's `handle_info/2`.
+
   The handler is the same over TCP and TLS: Thousand Island finishes
   the TLS handshake before `handle_connection/2`, and every read and
   write goes through `ThousandIsland.Socket`. The scheme (`"http"` or
@@ -28,6 +36,7 @@ defmodule MuroPlug.Handler do
   require Logger
 
   alias MuroPlug.{Adapter, Book, Chunked, HTTP}
+  alias MuroPlug.WebSocket.Connection
   alias ThousandIsland.Socket
 
   @impl ThousandIsland.Handler
@@ -49,6 +58,9 @@ defmodule MuroPlug.Handler do
   end
 
   @impl ThousandIsland.Handler
+  def handle_data(data, socket, %Connection{} = ws),
+    do: data |> Connection.handle_data(socket, ws) |> ws_continuation()
+
   def handle_data(data, socket, state) do
     buf = <<state.buf::binary, data::binary>>
     state = %{state | buf: buf}
@@ -56,12 +68,54 @@ defmodule MuroPlug.Handler do
   end
 
   @impl ThousandIsland.Handler
+  def handle_timeout(socket, %Connection{} = ws) do
+    _ = Connection.handle_timeout(socket, ws)
+    :ok
+  end
+
   def handle_timeout(_socket, state) do
     # NOW while reading or idle closes in the book. Thousand Island
     # closes the socket after this callback.
     _ = Book.step(state.st, :now, state.buf, state.cfg)
     :ok
   end
+
+  @impl ThousandIsland.Handler
+  def handle_close(_socket, %Connection{} = ws) do
+    _ = Connection.handle_close(ws)
+    :ok
+  end
+
+  def handle_close(_socket, _state), do: :ok
+
+  @impl ThousandIsland.Handler
+  def handle_shutdown(socket, %Connection{} = ws) do
+    _ = Connection.handle_shutdown(socket, ws)
+    :ok
+  end
+
+  def handle_shutdown(_socket, _state), do: :ok
+
+  @impl ThousandIsland.Handler
+  def handle_error(reason, _socket, %Connection{} = ws) do
+    _ = Connection.handle_error(reason, ws)
+    :ok
+  end
+
+  def handle_error(_reason, _socket, _state), do: :ok
+
+  # A WebSocket connection gets every other process message (PubSub,
+  # Phoenix channel replies, timers) through WebSock's handle_info/2.
+  @impl GenServer
+  def handle_info(msg, {socket, %Connection{} = ws}) do
+    case Connection.handle_info(msg, socket, ws) do
+      {:close, ws} -> {:stop, {:shutdown, :local_closed}, {socket, ws}}
+      {_continue_or_linger, ws} -> {:noreply, {socket, ws}}
+    end
+  end
+
+  defp ws_continuation({:close, ws}), do: {:close, ws}
+  defp ws_continuation({_continue_or_linger, ws}), do: {:continue, ws}
 
   ## The book's verdicts
 
@@ -114,6 +168,8 @@ defmodule MuroPlug.Handler do
         {:close, state}
 
       {body, tail} ->
+        headers = HTTP.headers(binary_part(buf, 0, hend))
+
         payload = %Adapter{
           socket: socket,
           cfg: state.cfg,
@@ -122,10 +178,11 @@ defmodule MuroPlug.Handler do
           sock: state.sock,
           http11: views.version == "HTTP/1.1",
           head: views.method == "HEAD",
+          method: views.method,
+          headers: headers,
           body: body
         }
 
-        headers = HTTP.headers(binary_part(buf, 0, hend))
         conn = build_conn(payload, views, headers, state)
         Process.delete(Adapter.sent_key())
         Process.delete(Adapter.body_error_key())
@@ -173,6 +230,17 @@ defmodule MuroPlug.Handler do
   defp finish({:ok, %Plug.Conn{state: :set} = conn}, req, tail, socket, state),
     do: finish({:ok, Plug.Conn.send_resp(conn)}, req, tail, socket, state)
 
+  defp finish(
+         {:ok,
+          %Plug.Conn{state: :upgraded, adapter: {Adapter, %{upgrade: {:websocket, _, _}} = p}} =
+            conn},
+         _req,
+         tail,
+         socket,
+         state
+       ),
+       do: websocket(conn, p, tail, socket, state)
+
   defp finish({:ok, %Plug.Conn{adapter: {Adapter, p}}}, req, tail, socket, state) do
     case {p.resp, Process.get(Adapter.body_error_key())} do
       {:unsent, error} when error != nil -> body_failed(error, req, socket, state)
@@ -183,13 +251,68 @@ defmodule MuroPlug.Handler do
   defp finish({:raised, kind, reason, stack}, req, _tail, socket, state) do
     error = Process.get(Adapter.body_error_key())
 
-    if error == nil and status_of(kind, reason) >= 500,
+    if error == nil and not upgrade_error?(reason) and status_of(kind, reason) >= 500,
       do: Logger.error(Exception.format(kind, reason, stack), crash_reason: {reason, stack})
 
     cond do
       Process.get(Adapter.sent_key()) -> {:close, state}
       error != nil -> body_failed(error, req, socket, state)
+      upgrade_error?(reason) -> upgrade_refused(reason, socket, state)
       true -> refuse(req, socket, state)
+    end
+  end
+
+  # A request that is not a WebSocket handshake, refused by the
+  # adapter's upgrade/3 or by WebSockAdapter's early validation: its
+  # status (400, or 426 with `sec-websocket-version: 13`), then close.
+  defp upgrade_error?(%MuroPlug.WebSocket.UpgradeError{}), do: true
+  defp upgrade_error?(%{__struct__: WebSockAdapter.UpgradeError}), do: true
+  defp upgrade_error?(_), do: false
+
+  defp upgrade_refused(error, socket, state) do
+    status = Map.get(error, :plug_status, 400)
+    message = Exception.message(error)
+
+    data =
+      HTTP.head(:"HTTP/1.1", status, Map.get(error, :headers, []), [
+        {"content-type", "text/plain"},
+        {"content-length", Integer.to_string(byte_size(message))},
+        {"connection", "close"},
+        {"date", HTTP.date()}
+      ])
+
+    _ = Socket.send(socket, [data, message])
+    {:close, state}
+  end
+
+  # The Plug upgraded: write the 101 with its response headers, then run
+  # the WebSocket on this socket with the bytes past the request.
+  defp websocket(
+         conn,
+         %Adapter{upgrade: {:websocket, {mod, ws_state, opts}, key}} = p,
+         tail,
+         socket,
+         state
+       ) do
+    if Adapter.body_open?(p) do
+      Socket.send(socket, HTTP.status_close(400))
+      {:close, state}
+    else
+      tail = if p.leftover != <<>>, do: p.leftover, else: tail
+      Process.put(Adapter.sent_key(), true)
+
+      case Socket.send(socket, MuroPlug.WebSocket.handshake(key, conn.resp_headers)) do
+        :ok ->
+          ws = Connection.new(mod, opts)
+
+          case Connection.init(ws, ws_state, tail, socket) do
+            {:close, ws} -> {:close, ws}
+            {_continue_or_linger, ws} -> {:continue, ws, {:persistent, ws.timeout}}
+          end
+
+        {:error, _} ->
+          {:close, state}
+      end
     end
   end
 

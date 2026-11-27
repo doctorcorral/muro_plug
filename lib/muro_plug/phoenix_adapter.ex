@@ -21,8 +21,12 @@ defmodule MuroPlug.PhoenixAdapter do
   `{endpoint, scheme}`. Relative TLS file paths in `:https` resolve
   against the endpoint's `:otp_app`, as in Plug.Cowboy and Bandit.
 
-  WebSockets (LiveView, channels) are a later milestone: `upgrade/3`
-  answers `{:error, :not_supported}`.
+  WebSockets work on either scheme (`ws://` and `wss://`): Phoenix's
+  socket transport calls `WebSockAdapter.upgrade/4`, which hands
+  `{socket_module, state, opts}` to `MuroPlug.Adapter.upgrade/3`, so
+  `Phoenix.Socket` channels and LiveView run on MuroPlug. The endpoint's
+  `websocket:` options (`:timeout`, `:max_frame_size`, `:compress`,
+  ...) are the ones listed in `MuroPlug.WebSocket`.
   """
 
   @doc false

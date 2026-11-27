@@ -12,9 +12,11 @@ The package will live under `doctorcorral` until launch, then move to
 
 ## Status
 
-HTTP/1.1 over TCP and over TLS (HTTPS). Not published to Hex.
-WebSockets (LiveView) are later. No HTTP/2: over TLS, ALPN advertises
-`http/1.1` only.
+HTTP/1.1 over TCP and over TLS (HTTPS), and WebSockets (RFC 6455,
+through `WebSock`) over both: `ws://` and `wss://`, including Phoenix
+channels and LiveView sockets. Not published to Hex. No HTTP/2: over
+TLS, ALPN advertises `http/1.1` only. No WebSocket compression
+(`permessage-deflate`) yet.
 
 ## Usage
 
@@ -84,6 +86,77 @@ Thousand Island's SSL `sendfile/4`: `:file.pread` of at most 1 MiB at
 a time, written with `:ssl.send` (TCP uses the kernel's
 `:file.sendfile`).
 
+## WebSockets
+
+A Plug upgrades with `WebSockAdapter.upgrade/4` (what
+`Phoenix.Endpoint` sockets and LiveView do) or directly with
+`Plug.Conn.upgrade_adapter(conn, :websocket, {MyWebSock, state, opts})`:
+
+```elixir
+defmodule MyApp.Router do
+  use Plug.Router
+  plug :match
+  plug :dispatch
+
+  get "/ws" do
+    WebSockAdapter.upgrade(conn, MyApp.EchoSocket, %{}, timeout: 60_000)
+  end
+end
+```
+
+`muro_plug` depends on `websock` only; `websock_adapter` (a Phoenix
+dependency already) is what applications call.
+
+* The request head is parsed and validated by the book like any other
+  request. `MuroPlug.Adapter.upgrade/3` then checks the RFC 6455
+  opening handshake: `GET`, HTTP/1.1, a Host, an `Upgrade` header with
+  the `websocket` token and a `Connection` header with `upgrade`
+  (case-insensitive, in a list or across lines), `Sec-WebSocket-Version:
+  13`, and one `Sec-WebSocket-Key` that is base64 of 16 octets. A
+  failing request raises `MuroPlug.WebSocket.UpgradeError` and gets
+  `400`, or `426` with `sec-websocket-version: 13` for another version
+  (`WebSockAdapter`'s own early check answers `400`, and Phoenix
+  renders its own `400`).
+* When the Plug returns, `MuroPlug.Handler` writes `101 Switching
+  Protocols` with `Sec-WebSocket-Accept` and the response headers the
+  Plug set (`set-cookie`, `sec-websocket-protocol`, ...; never a second
+  `upgrade`/`connection`/`sec-websocket-accept`, and never
+  `sec-websocket-extensions`), then runs
+  `MuroPlug.WebSocket.Connection` on the same `ThousandIsland.Socket`.
+  Bytes the client sent after the upgrade request (a pipelined first
+  frame) are the first frame bytes.
+* Framing: client frames must be masked; server frames are not. 7-,
+  16-, and 64-bit lengths; unmasking is one `:crypto.exor` over the
+  payload binary. Text, binary, continuation, ping (answered with a pong
+  of the same payload before `handle_control/2`), pong, and close.
+  Fragmented messages are reassembled with control frames allowed
+  between fragments. Text messages and close reasons must be UTF-8.
+* Failures close the connection with a close frame: 1002 for an
+  unmasked frame, RSV bits (no extension is negotiated), a reserved
+  opcode, a fragmented or over-125-byte control frame, an unexpected
+  continuation or a data frame inside a fragmented message, a 1-byte
+  close or a close code that may not be sent, or a 64-bit length with
+  the high bit set; 1007 for invalid UTF-8; 1009 past
+  `:max_frame_size` (checked on the frame header) or
+  `:max_message_size`.
+* `WebSock` callbacks: `init/1`, `handle_in/2`, `handle_control/2`
+  (optional), `handle_info/2` for every other process message (PubSub,
+  channel processes), `terminate/2` (optional, called once: `:normal`,
+  `:remote`, `:shutdown`, `:timeout`, or `{:error, reason}`), and every
+  return: `{:ok, s}`, `{:push, frames, s}`, `{:reply, _, frames, s}`,
+  and the three `{:stop, ...}` forms (`:normal` closes with 1000,
+  `{:shutdown, :restart}` with 1012, other reasons with 1011; a raise is
+  logged and closes with 1011). A client close is echoed with its code.
+  After a server close the connection waits up to `:close_timeout` for
+  the client's close.
+* Options (the upgrade's `opts`): `:timeout` (idle, default 60_000 ms;
+  then close 1001 and `terminate(:timeout, _)`), `:max_frame_size`
+  (default 10_000_000), `:max_message_size` (default the frame limit),
+  `:validate_utf8` (default `true`), `:close_timeout` (default 5_000
+  ms), `:fullsweep_after`, `:max_heap_size`. `:compress` is accepted and
+  ignored: `permessage-deflate` is never advertised. A server shutdown
+  closes open WebSockets with 1001.
+
 ## How it fits together
 
 ```
@@ -98,6 +171,12 @@ MuroPlug.Handler: read more │ owe 400/413/414/417/431/501 and close
                               │
                               ▼ wrote fact
         book closes, idles, or classifies the pipelined tail
+
+upgrade_adapter(:websocket) ──▶ Adapter.upgrade/3 checks the handshake
+                              │ Plug returns
+                              ▼
+        101 Switching Protocols ──▶ MuroPlug.WebSocket.Connection
+        (frames + WebSock callbacks on the same ThousandIsland.Socket)
 ```
 
 * `priv/muro/http/step.muro` and `request.muro` are byte-identical
@@ -122,6 +201,10 @@ MuroPlug.Handler: read more │ owe 400/413/414/417/431/501 and close
   book validates the framing), reading a streamed body (Content-Length
   past 16384, or a chunk tail past 16384) from the socket, and rendering
   status lines and headers.
+* WebSocket framing after a `101` (`MuroPlug.WebSocket`,
+  `MuroPlug.WebSocket.Frame`, `MuroPlug.WebSocket.Connection`) is host
+  code; muro-http has no WebSocket book yet. The book still decides the
+  HTTP/1.1 upgrade request itself.
 
 ## Octets stay binaries
 
@@ -162,6 +245,20 @@ certificates, DER `:cert`/`:key`, option errors, a `Plug.Router` app
 through `:httpc` over HTTPS, and Phoenix endpoints with `https:` alone
 and `http:` + `https:` together, with `server_info/2` for each.
 `openssl` must be on the `PATH` for `mix test`.
+
+`test/websocket_test.exs` runs every WebSocket test over real TCP
+(`ws://`) and real TLS (`wss://`) sockets with a raw frame client:
+the handshake and `Sec-WebSocket-Accept` (and RFC 6455's example),
+response headers on the 101, rejected upgrades (400/426), text and
+binary echo, 16- and 64-bit lengths, fragmentation with pings between
+fragments, one-byte packets, a first frame pipelined with the upgrade
+request, each 1002/1007/1009 failure above, `handle_info/2` pushes,
+`handle_control/2`, `terminate/2` on client close, server stop,
+timeout, a dropped socket and server shutdown, close codes and reasons,
+a raising callback, and a `Phoenix.Endpoint` with both `http:` and
+`https:` serving a `Phoenix.Socket.Transport` and a `Phoenix.Socket`
+channel (join, reply, a 70 KB broadcast, heartbeat) over `ws://` and
+`wss://`.
 
 ## Performance
 

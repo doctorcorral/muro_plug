@@ -12,6 +12,9 @@ defmodule MuroPlug.Adapter do
   Request and response bodies are binaries or iodata of binaries. A
   body is never a list of octets.
 
+  `upgrade/3` takes a `:websocket` upgrade (`WebSock`), see
+  `MuroPlug.WebSocket`.
+
   Over TLS the same calls go through `ThousandIsland.Transports.SSL`.
   `send_file/6` uses `ThousandIsland.Socket.sendfile/4`, which is the
   kernel's `:file.sendfile` on TCP and, on SSL, `:file.pread` of up to
@@ -30,6 +33,9 @@ defmodule MuroPlug.Adapter do
     :req,
     :peer,
     :sock,
+    method: "GET",
+    headers: [],
+    upgrade: nil,
     http11: true,
     head: false,
     body: :done,
@@ -153,7 +159,38 @@ defmodule MuroPlug.Adapter do
 
   def inform(%__MODULE__{}, _status, _headers), do: {:error, :not_supported}
 
+  @doc """
+  `Plug.Conn.upgrade_adapter(conn, :websocket, {websock, state, opts})`,
+  the tuple `WebSockAdapter.upgrade/4` passes to every server but Cowboy.
+
+  The request must be an RFC 6455 opening handshake
+  (`MuroPlug.WebSocket.check/3`); if not, this raises
+  `MuroPlug.WebSocket.UpgradeError` (400, or 426 for a version other
+  than 13). The spec is kept on the payload; after the Plug returns,
+  `MuroPlug.Handler` writes the 101 and runs the WebSocket on this
+  socket. Other protocols are `{:error, :not_supported}`.
+  """
   @impl true
+  def upgrade(%__MODULE__{} = p, :websocket, {websock, _state, opts} = spec)
+      when is_atom(websock) and is_list(opts) do
+    case MuroPlug.WebSocket.check(p.method, p.http11, p.headers) do
+      {:ok, key} ->
+        {:ok, %{p | upgrade: {:websocket, spec, key}}}
+
+      {:error, status, message, headers} ->
+        raise MuroPlug.WebSocket.UpgradeError,
+          message: message,
+          plug_status: status,
+          headers: headers
+    end
+  end
+
+  def upgrade(%__MODULE__{}, :websocket, spec) do
+    raise ArgumentError,
+          "MuroPlug: a :websocket upgrade takes {websock_module, state, opts}, got: " <>
+            inspect(spec)
+  end
+
   def upgrade(_payload, _protocol, _opts), do: {:error, :not_supported}
 
   @impl true
